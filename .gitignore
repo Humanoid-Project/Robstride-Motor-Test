@@ -1,4 +1,10 @@
 .venv/
 .vscode/
+
 __pycache__/
 *.pyc
+
+.agents/
+.codex/
+
+docs/

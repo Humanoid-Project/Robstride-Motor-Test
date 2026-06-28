@@ -1,4 +1,4 @@
-# Robstride-03 Motor Test
+# Robstride-Motor-Test
 
 ## Setup
 
@@ -23,9 +23,5 @@ sudo ip link set can0 txqueuelen 1000
 ```bash
 cd rs03_test/
 
-# Communication test
-python3 vbus_test.py
-
-# Motor run
-python3 motor_run.py
+python3 rs03_test/motor_run.py
 ```
