@@ -14,7 +14,7 @@ import can
 
 
 HOST_ID = 0xFD
-DEFAULT_MOTOR_ID = 4
+DEFAULT_MOTOR_ID = 5
 DEFAULT_CHANNEL = "can0"
 DEFAULT_INTERFACE = "socketcan"
 
@@ -23,23 +23,26 @@ P_MAX = 12.57
 V_MIN = -20.0
 V_MAX = 20.0
 KP_MIN = 0.0
-KP_MAX = 5000.0
-KD_MIN = 0.0
+KP_MAX = 5.0
+# Protocol-correct Kp encoding scale (manual: Kp [0~65535] -> 0.0~5000.0).
+# Used only for return-home / position-hold so return_kp encodes correctly.
+RETURN_KP_MAX = 5000.0
 KD_MAX = 100.0
+KD_MIN = 0.0
 T_MIN = -60.0
 T_MAX = 60.0
-VELOCITY_CONTROL_KP = 0.0
-SAFE_MAX_SPEED = 0.35
+SAFE_MAX_SPEED = 2.0
 SAFE_MAX_ACCEL = 0.25
 SAFE_DEFAULT_ACCEL = 0.10
 SAFE_MAX_JOG_SPEED = 0.05
-SAFE_MAX_KD = 2.0
+SAFE_MAX_KD = 5.0
+SAFE_MAX_VEL_KP = 5.0
 SAFE_MAX_RETURN_SPEED = 0.20
+SAFE_MAX_POSITION_SPEED = 1.0
 SAFE_MIN_RETURN_TIME = 4.0
-SAFE_MAX_RETURN_KP = 2.0
-SAFE_MAX_RETURN_KD = 2.0
-SAFE_MAX_TORQUE_ASSIST = 0.60
-SAFE_OVERSPEED_STOP = 0.80
+SAFE_MAX_RETURN_KP = 8.0
+SAFE_MAX_RETURN_KD = 5.0
+SAFE_OVERSPEED_STOP = 2.0
 SAFE_CLOSE_TIMEOUT = 90.0
 
 VBUS_INDEX = 0x701C
@@ -168,11 +171,11 @@ class RS03Motor:
         self.send(0x12, self.host_id, data)
         return self.drain_feedback()
 
-    def control_operation_mode(self, pos, vel, kp, kd, torque=0.0):
+    def control_operation_mode(self, pos, vel, kp, kd, torque=0.0, kp_max=KP_MAX):
         data16 = float_to_uint(torque, T_MIN, T_MAX, 16)
         raw_pos = float_to_uint(pos, P_MIN, P_MAX, 16)
         raw_vel = float_to_uint(vel, V_MIN, V_MAX, 16)
-        raw_kp = float_to_uint(kp, KP_MIN, KP_MAX, 16)
+        raw_kp = float_to_uint(kp, KP_MIN, kp_max, 16)
         raw_kd = float_to_uint(kd, KD_MIN, KD_MAX, 16)
 
         data = bytes(
@@ -225,6 +228,7 @@ class MotorController(threading.Thread):
         self.pending_stop = False
         self.pending_clear_fault = False
         self.pending_zero_position = False
+        self.pending_move_to = None
         self.pending_shutdown = False
         self.shutdown_return_home = True
         self.shutdown_active = False
@@ -236,9 +240,11 @@ class MotorController(threading.Thread):
         self.target_velocity = 0.0
         self.command_velocity = 0.0
         self.accel_limit = args.accel
+        self.kp = args.kp
         self.kd = args.kd
-        self.torque_assist = args.torque_assist
-        self.torque_ff = 0.0
+        self.return_kp = args.return_kp
+        self.return_kd = args.return_kd
+        self.move_speed = clamp(getattr(args, "move_speed", SAFE_MAX_POSITION_SPEED), 0.01, SAFE_MAX_POSITION_SPEED)
         self.state = {
             "timestamp": 0.0,
             "feedback_timestamp": 0.0,
@@ -248,7 +254,6 @@ class MotorController(threading.Thread):
             "acceleration": 0.0,
             "command_velocity": 0.0,
             "target_velocity": 0.0,
-            "torque_ff": 0.0,
             "torque": 0.0,
             "vbus": 0.0,
             "temperature": 0.0,
@@ -272,13 +277,25 @@ class MotorController(threading.Thread):
         with self.lock:
             self.accel_limit = clamp(float(value), 0.01, SAFE_MAX_ACCEL)
 
+    def set_kp(self, value):
+        with self.lock:
+            self.kp = clamp(float(value), 0.0, SAFE_MAX_VEL_KP)
+
     def set_kd(self, value):
         with self.lock:
             self.kd = clamp(float(value), 0.0, SAFE_MAX_KD)
 
-    def set_torque_assist(self, value):
+    def set_return_kp(self, value):
         with self.lock:
-            self.torque_assist = clamp(float(value), 0.0, SAFE_MAX_TORQUE_ASSIST)
+            self.return_kp = clamp(float(value), 0.0, SAFE_MAX_RETURN_KP)
+
+    def set_return_kd(self, value):
+        with self.lock:
+            self.return_kd = clamp(float(value), 0.0, SAFE_MAX_RETURN_KD)
+
+    def set_move_speed(self, value):
+        with self.lock:
+            self.move_speed = clamp(float(value), 0.01, SAFE_MAX_POSITION_SPEED)
 
     def request_enable(self):
         with self.lock:
@@ -289,11 +306,9 @@ class MotorController(threading.Thread):
             self.pending_stop = True
             self.target_velocity = 0.0
             self.command_velocity = 0.0
-            self.torque_ff = 0.0
             self.position_hold_target = None
             self.state["target_velocity"] = 0.0
             self.state["command_velocity"] = 0.0
-            self.state["torque_ff"] = 0.0
 
     def request_clear_fault(self):
         with self.lock:
@@ -304,12 +319,20 @@ class MotorController(threading.Thread):
             self.pending_zero_position = True
             self.target_velocity = 0.0
             self.command_velocity = 0.0
-            self.torque_ff = 0.0
             self.position_hold_target = None
             self.state["target_velocity"] = 0.0
             self.state["command_velocity"] = 0.0
-            self.state["torque_ff"] = 0.0
             self.state["status"] = "Returning zero..."
+
+    def request_move_to(self, target_position):
+        with self.lock:
+            self.pending_move_to = clamp(float(target_position), P_MIN, P_MAX)
+            self.target_velocity = 0.0
+            self.command_velocity = 0.0
+            self.position_hold_target = None
+            self.state["target_velocity"] = 0.0
+            self.state["command_velocity"] = 0.0
+            self.state["status"] = "Moving to position..."
 
     def request_shutdown(self, return_home=True):
         with self.lock:
@@ -318,11 +341,9 @@ class MotorController(threading.Thread):
             self.shutdown_active = True
             self.target_velocity = 0.0
             self.command_velocity = 0.0
-            self.torque_ff = 0.0
             self.position_hold_target = None
             self.state["target_velocity"] = 0.0
             self.state["command_velocity"] = 0.0
-            self.state["torque_ff"] = 0.0
             self.state["status"] = "Returning home..." if return_home else "Closing..."
 
     def snapshot(self):
@@ -378,7 +399,6 @@ class MotorController(threading.Thread):
                     "acceleration": acceleration,
                     "command_velocity": self.command_velocity,
                     "target_velocity": self.target_velocity,
-                    "torque_ff": self.torque_ff,
                     "torque": feedback["torque"],
                     "temperature": feedback["temperature"],
                     "fault_flags": feedback["fault_flags"],
@@ -444,11 +464,9 @@ class MotorController(threading.Thread):
         with self.lock:
             self.target_velocity = 0.0
             self.command_velocity = 0.0
-            self.torque_ff = 0.0
             self.position_hold_target = None
             self.state["target_velocity"] = 0.0
             self.state["command_velocity"] = 0.0
-            self.state["torque_ff"] = 0.0
 
         try:
             motor.stop()
@@ -457,7 +475,9 @@ class MotorController(threading.Thread):
             self.publish_status(f"Overspeed stop ({feedback['velocity']:+.2f} rad/s)")
         return True
 
-    def move_to_position(self, motor, target_position, status, hold_after=False):
+    def move_to_position(self, motor, target_position, status, hold_after=False,
+                         max_speed=SAFE_MAX_RETURN_SPEED, interruptible=False):
+        move_speed = clamp(abs(max_speed), 0.01, SAFE_MAX_POSITION_SPEED)
         with self.lock:
             start_position = self.state["position"]
             has_feedback = self.state["feedback_timestamp"] > 0.0
@@ -479,18 +499,29 @@ class MotorController(threading.Thread):
         distance = abs(travel)
         return_time = max(SAFE_MIN_RETURN_TIME, self.args.return_time)
         if distance > 1e-6:
-            return_time = max(return_time, 1.5 * distance / SAFE_MAX_RETURN_SPEED)
-        return_kp = clamp(self.args.return_kp, 0.0, SAFE_MAX_RETURN_KP)
-        return_kd = clamp(self.args.return_kd, 0.0, SAFE_MAX_RETURN_KD)
+            return_time = max(return_time, 1.5 * distance / move_speed)
+        with self.lock:
+            return_kp = clamp(self.return_kp, 0.0, SAFE_MAX_RETURN_KP)
+            return_kd = clamp(self.return_kd, 0.0, SAFE_MAX_RETURN_KD)
         period = max(0.005, 1.0 / self.args.rate)
         start_time = time.monotonic()
         last_time = start_time
         start_position = self.current_position() if has_feedback else start_position
 
+        def should_interrupt():
+            if not interruptible:
+                return False
+            with self.lock:
+                return self.pending_move_to is not None or self.pending_stop
+
         with self.lock:
             self.motion_active = True
         self.publish_status(status)
         while not self.stop_event.is_set():
+            if should_interrupt():
+                with self.lock:
+                    self.motion_active = False
+                return False
             now = time.monotonic()
             elapsed = now - start_time
             progress = min(1.0, elapsed / return_time)
@@ -499,8 +530,8 @@ class MotorController(threading.Thread):
             command_position = start_position + travel * smooth
             command_velocity = clamp(
                 travel * smooth_velocity,
-                -SAFE_MAX_RETURN_SPEED,
-                SAFE_MAX_RETURN_SPEED,
+                -move_speed,
+                move_speed,
             )
 
             feedback = motor.control_operation_mode(
@@ -509,6 +540,7 @@ class MotorController(threading.Thread):
                 kp=return_kp,
                 kd=return_kd,
                 torque=0.0,
+                kp_max=RETURN_KP_MAX,
             )
             dt = max(1e-4, now - last_time)
             last_time = now
@@ -527,6 +559,10 @@ class MotorController(threading.Thread):
 
         hold_deadline = time.monotonic() + max(0.0, self.args.return_hold_time)
         while not self.stop_event.is_set() and time.monotonic() < hold_deadline:
+            if should_interrupt():
+                with self.lock:
+                    self.motion_active = False
+                return False
             now = time.monotonic()
             feedback = motor.control_operation_mode(
                 pos=target_position,
@@ -534,6 +570,7 @@ class MotorController(threading.Thread):
                 kp=return_kp,
                 kd=return_kd,
                 torque=0.0,
+                kp_max=RETURN_KP_MAX,
             )
             self.publish_feedback(feedback, now, 0.0)
             if self.stop_on_overspeed(motor, feedback):
@@ -591,11 +628,16 @@ class MotorController(threading.Thread):
         self.send_final_stop(motor)
         self.stop_event.set()
 
+    def make_motor(self, bus):
+        # Seam so subclasses (e.g. daisy-chain with per-model encoding) can swap
+        # in a spec-aware motor class. Default keeps single-motor RS03 behavior.
+        return RS03Motor(bus=bus, motor_id=self.args.motor_id, host_id=self.args.host_id)
+
     def run(self):
         bus = None
         try:
             bus = can.Bus(channel=self.args.channel, interface=self.args.interface)
-            motor = RS03Motor(bus=bus, motor_id=self.args.motor_id, host_id=self.args.host_id)
+            motor = self.make_motor(bus)
             self.publish_status("Connected")
             self.event_queue.put(("status", "Connected"))
             initial_position, feedback = motor.read_float_parameter(MECH_POS_INDEX, timeout=0.05)
@@ -618,16 +660,18 @@ class MotorController(threading.Thread):
                     pending_stop = self.pending_stop
                     pending_clear_fault = self.pending_clear_fault
                     pending_zero_position = self.pending_zero_position
+                    pending_move_to = self.pending_move_to
                     pending_shutdown = self.pending_shutdown
                     shutdown_return_home = self.shutdown_return_home
                     target_velocity = clamp(self.target_velocity, -self.args.max_speed, self.args.max_speed)
                     accel_limit = clamp(self.accel_limit, 0.01, SAFE_MAX_ACCEL)
+                    kp = clamp(self.kp, 0.0, SAFE_MAX_VEL_KP)
                     kd = clamp(self.kd, 0.0, SAFE_MAX_KD)
-                    torque_assist = clamp(self.torque_assist, 0.0, SAFE_MAX_TORQUE_ASSIST)
                     self.pending_enable = False
                     self.pending_stop = False
                     self.pending_clear_fault = False
                     self.pending_zero_position = False
+                    self.pending_move_to = None
                     self.pending_shutdown = False
 
                 if pending_shutdown:
@@ -646,6 +690,24 @@ class MotorController(threading.Thread):
                         self.command_velocity = 0.0
                         self.send_zero_velocity(motor, count=5)
                         self.move_to_position(motor, 0.0, "Returning zero", hold_after=True)
+
+                if pending_move_to is not None:
+                    if not self.enabled:
+                        self.publish_status("Enable before Move")
+                    else:
+                        target_velocity = 0.0
+                        self.command_velocity = 0.0
+                        self.send_zero_velocity(motor, count=5)
+                        with self.lock:
+                            move_speed = self.move_speed
+                        self.move_to_position(
+                            motor,
+                            pending_move_to,
+                            "Moving to position",
+                            hold_after=True,
+                            max_speed=move_speed,
+                            interruptible=True,
+                        )
 
                 if pending_enable and not self.enabled:
                     motor.write_uint8_parameter(RUN_MODE_INDEX, OPERATION_RUN_MODE)
@@ -669,13 +731,13 @@ class MotorController(threading.Thread):
 
                     if hold_target is not None and abs(target_velocity) <= 1e-6:
                         self.command_velocity = 0.0
-                        self.torque_ff = 0.0
                         feedback = motor.control_operation_mode(
                             pos=hold_target,
                             vel=0.0,
-                            kp=clamp(self.args.return_kp, 0.0, SAFE_MAX_RETURN_KP),
-                            kd=clamp(self.args.return_kd, 0.0, SAFE_MAX_RETURN_KD),
+                            kp=clamp(self.return_kp, 0.0, SAFE_MAX_RETURN_KP),
+                            kd=clamp(self.return_kd, 0.0, SAFE_MAX_RETURN_KD),
                             torque=0.0,
+                            kp_max=RETURN_KP_MAX,
                         )
                     else:
                         delta = target_velocity - self.command_velocity
@@ -689,17 +751,12 @@ class MotorController(threading.Thread):
                             -self.args.max_speed,
                             self.args.max_speed,
                         )
-                        if abs(self.command_velocity) > 1e-4:
-                            self.torque_ff = math.copysign(torque_assist, self.command_velocity)
-                        else:
-                            self.torque_ff = 0.0
-
                         feedback = motor.control_operation_mode(
                             pos=self.current_position(),
                             vel=self.command_velocity,
-                            kp=VELOCITY_CONTROL_KP,
+                            kp=kp,
                             kd=kd,
-                            torque=self.torque_ff,
+                            torque=0.0,
                         )
                     self.publish_feedback(feedback, now, dt)
                     self.stop_on_overspeed(motor, feedback)
@@ -723,7 +780,7 @@ class MotorController(threading.Thread):
         finally:
             if bus is not None:
                 try:
-                    motor = RS03Motor(bus=bus, motor_id=self.args.motor_id, host_id=self.args.host_id)
+                    motor = self.make_motor(bus)
                     self.send_final_stop(motor)
                 except Exception:
                     pass
@@ -863,8 +920,11 @@ class MotorRunApp:
         self.velocity_var = tk.DoubleVar(value=0.0)
         self.accel_var = tk.DoubleVar(value=args.accel)
         self.kd_var = tk.DoubleVar(value=args.kd)
-        self.torque_assist_var = tk.DoubleVar(value=args.torque_assist)
-        self.velocity_kp_var = tk.StringVar(value=f"{VELOCITY_CONTROL_KP:.3f}")
+        self.kp_var = tk.DoubleVar(value=args.kp)
+        self.target_angle_var = tk.StringVar(value="0.0")
+        self.return_kp_var = tk.DoubleVar(value=args.return_kp)
+        self.return_kd_var = tk.DoubleVar(value=args.return_kd)
+        self.move_speed_var = tk.DoubleVar(value=getattr(args, "move_speed", SAFE_MAX_POSITION_SPEED))
 
         self.status_var = tk.StringVar(value="Starting...")
         self.feedback_var = tk.StringVar(value="none")
@@ -874,7 +934,6 @@ class MotorRunApp:
         self.accel_read_var = tk.StringVar(value="0.000 rad/s^2")
         self.command_var = tk.StringVar(value="0.000 rad/s")
         self.target_var = tk.StringVar(value="0.000 rad/s")
-        self.torque_ff_var = tk.StringVar(value="0.000 N.m")
         self.vbus_var = tk.StringVar(value="0.00 V")
         self.vbus_age_var = tk.StringVar(value="none")
         self.torque_var = tk.StringVar(value="0.00 N.m")
@@ -893,8 +952,11 @@ class MotorRunApp:
         controller_args = copy.copy(self.args)
         controller_args.motor_id = motor_id
         controller_args.accel = self.accel_var.get()
+        controller_args.kp = self.kp_var.get()
         controller_args.kd = self.kd_var.get()
-        controller_args.torque_assist = self.torque_assist_var.get()
+        controller_args.return_kp = self.return_kp_var.get()
+        controller_args.return_kd = self.return_kd_var.get()
+        controller_args.move_speed = self.move_speed_var.get()
         self.current_motor_id = motor_id
         self.controller = MotorController(controller_args, self.events)
         self.controller.start()
@@ -976,7 +1038,6 @@ class MotorRunApp:
         self.add_value(status_frame, "Accel est.", self.accel_read_var)
         self.add_value(status_frame, "Target", self.target_var)
         self.add_value(status_frame, "Command", self.command_var)
-        self.add_value(status_frame, "Torque FF", self.torque_ff_var)
         self.add_value(status_frame, "VBUS", self.vbus_var)
         self.add_value(status_frame, "VBUS age", self.vbus_age_var)
         self.add_value(status_frame, "Torque", self.torque_var)
@@ -984,35 +1045,32 @@ class MotorRunApp:
         self.add_value(status_frame, "Mode", self.mode_var)
         self.add_value(status_frame, "Fault", self.fault_var)
 
-        control_frame = ttk.LabelFrame(right, text="Control", padding=10)
-        control_frame.pack(fill=tk.X, pady=(0, 10))
+        # Common motor buttons -- apply in both test modes.
+        button_frame = ttk.Frame(right)
+        button_frame.pack(fill=tk.X, pady=(0, 8))
+        ttk.Button(button_frame, text="Enable", command=self.enable_motor).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(button_frame, text="Stop", command=self.stop_motor).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
+        ttk.Button(button_frame, text="Clear Fault", command=self.clear_fault).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
 
+        notebook = ttk.Notebook(right)
+        notebook.pack(fill=tk.X, pady=(0, 10))
+
+        # --- Speed control test ---
+        speed_tab = ttk.Frame(notebook, padding=10)
+        notebook.add(speed_tab, text="Speed test")
         self.add_slider(
-            control_frame,
+            speed_tab,
             "Target velocity (rad/s)",
             self.velocity_var,
             -abs(self.args.max_speed),
             abs(self.args.max_speed),
             self.on_velocity_change,
         )
-        self.add_slider(control_frame, "Accel limit (rad/s^2)", self.accel_var, 0.01, SAFE_MAX_ACCEL, self.on_accel_change)
-        self.add_value(control_frame, "Velocity Kp", self.velocity_kp_var)
-        self.add_slider(control_frame, "Kd", self.kd_var, 0.0, SAFE_MAX_KD, self.on_kd_change)
-        self.add_slider(
-            control_frame,
-            "Torque assist (N.m)",
-            self.torque_assist_var,
-            0.0,
-            SAFE_MAX_TORQUE_ASSIST,
-            self.on_torque_assist_change,
-        )
+        self.add_slider(speed_tab, "Accel limit (rad/s^2)", self.accel_var, 0.01, SAFE_MAX_ACCEL, self.on_accel_change)
+        self.add_slider(speed_tab, "Kp", self.kp_var, 0.0, SAFE_MAX_VEL_KP, self.on_kp_change)
+        self.add_slider(speed_tab, "Kd", self.kd_var, 0.0, SAFE_MAX_KD, self.on_kd_change)
 
-        button_frame = ttk.Frame(control_frame)
-        button_frame.pack(fill=tk.X, pady=(12, 0))
-        ttk.Button(button_frame, text="Enable", command=self.enable_motor).pack(side=tk.LEFT, fill=tk.X, expand=True)
-        ttk.Button(button_frame, text="Stop", command=self.stop_motor).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
-
-        jog_frame = ttk.Frame(control_frame)
+        jog_frame = ttk.Frame(speed_tab)
         jog_frame.pack(fill=tk.X, pady=(8, 0))
         ttk.Button(jog_frame, text="- Jog", command=lambda: self.adjust_velocity(-abs(self.args.jog_speed))).pack(
             side=tk.LEFT, fill=tk.X, expand=True
@@ -1024,7 +1082,27 @@ class MotorRunApp:
             side=tk.LEFT, fill=tk.X, expand=True
         )
 
-        ttk.Button(control_frame, text="Clear Fault", command=self.clear_fault).pack(fill=tk.X, pady=(8, 0))
+        # --- Position control test ---
+        position_tab = ttk.Frame(notebook, padding=10)
+        notebook.add(position_tab, text="Position test")
+        angle_row = ttk.Frame(position_tab)
+        angle_row.pack(fill=tk.X)
+        ttk.Label(angle_row, text="Target angle (deg)", width=18).pack(side=tk.LEFT)
+        angle_entry = ttk.Entry(angle_row, textvariable=self.target_angle_var, width=10, justify=tk.RIGHT)
+        angle_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        angle_entry.bind("<Return>", lambda _event: self.go_to_angle())
+        ttk.Button(angle_row, text="Go", command=self.go_to_angle).pack(side=tk.LEFT, padx=(8, 0))
+        self.add_slider(position_tab, "Move speed (rad/s)", self.move_speed_var, 0.01, SAFE_MAX_POSITION_SPEED, self.on_move_speed_change)
+        self.add_slider(position_tab, "Position Kp", self.return_kp_var, 0.0, SAFE_MAX_RETURN_KP, self.on_return_kp_change)
+        self.add_slider(position_tab, "Position Kd", self.return_kd_var, 0.0, SAFE_MAX_RETURN_KD, self.on_return_kd_change)
+        ttk.Label(
+            position_tab,
+            text="Enable first, then Go. Moves smoothly to the angle and holds it. "
+            "Raise Position Kp until it overcomes friction.",
+            justify=tk.LEFT,
+            wraplength=320,
+            foreground="#7E8A97",
+        ).pack(anchor="w", pady=(6, 0))
 
         hint = ttk.LabelFrame(right, text="Keys", padding=10)
         hint.pack(fill=tk.X)
@@ -1072,10 +1150,26 @@ class MotorRunApp:
             value_text.set(f"{variable.get():.3f}")
 
         variable.trace_add("write", refresh_label)
-        slider = ttk.Scale(frame, from_=min_value, to=max_value, variable=variable, command=lambda _value: command())
-        slider.pack(fill=tk.X)
-        value_label = ttk.Label(frame, textvariable=value_text)
-        value_label.pack(anchor="e")
+
+        row = ttk.Frame(frame)
+        row.pack(fill=tk.X)
+        slider = ttk.Scale(row, from_=min_value, to=max_value, variable=variable, command=lambda _value: command())
+        slider.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        def apply_entry(*_args):
+            try:
+                value = float(value_text.get())
+            except ValueError:
+                value_text.set(f"{variable.get():.3f}")
+                return
+            value = max(min_value, min(max_value, value))
+            variable.set(value)
+            command()
+
+        entry = ttk.Entry(row, textvariable=value_text, width=9, justify=tk.RIGHT)
+        entry.pack(side=tk.LEFT, padx=(8, 0))
+        entry.bind("<Return>", apply_entry)
+        entry.bind("<FocusOut>", apply_entry)
 
     def bind_keys(self):
         self.root.bind("<Left>", lambda _event: self.adjust_velocity(-abs(self.args.jog_speed)))
@@ -1099,6 +1193,20 @@ class MotorRunApp:
         if self.controller is not None:
             self.controller.request_zero_position()
 
+    def go_to_angle(self):
+        try:
+            angle_deg = float(self.target_angle_var.get())
+        except ValueError:
+            messagebox.showerror("Invalid angle", "Target angle must be a number in degrees.")
+            return
+        target_rad = math.radians(angle_deg)
+        clamped = clamp(target_rad, P_MIN, P_MAX)
+        if abs(clamped - target_rad) > 1e-9:
+            self.target_angle_var.set(f"{math.degrees(clamped):.1f}")
+        self.set_velocity(0.0)
+        if self.controller is not None:
+            self.controller.request_move_to(clamped)
+
     def enable_motor(self):
         if self.controller is not None:
             self.controller.request_enable()
@@ -1120,13 +1228,25 @@ class MotorRunApp:
         if self.controller is not None:
             self.controller.set_accel_limit(self.accel_var.get())
 
+    def on_kp_change(self):
+        if self.controller is not None:
+            self.controller.set_kp(self.kp_var.get())
+
     def on_kd_change(self):
         if self.controller is not None:
             self.controller.set_kd(self.kd_var.get())
 
-    def on_torque_assist_change(self):
+    def on_return_kp_change(self):
         if self.controller is not None:
-            self.controller.set_torque_assist(self.torque_assist_var.get())
+            self.controller.set_return_kp(self.return_kp_var.get())
+
+    def on_return_kd_change(self):
+        if self.controller is not None:
+            self.controller.set_return_kd(self.return_kd_var.get())
+
+    def on_move_speed_change(self):
+        if self.controller is not None:
+            self.controller.set_move_speed(self.move_speed_var.get())
 
     def update_loop(self):
         self.handle_events()
@@ -1167,7 +1287,6 @@ class MotorRunApp:
         self.accel_read_var.set(f"{state['acceleration']:+.4f} rad/s^2")
         self.target_var.set(f"{state['target_velocity']:+.4f} rad/s")
         self.command_var.set(f"{state['command_velocity']:+.4f} rad/s")
-        self.torque_ff_var.set(f"{state['torque_ff']:+.3f} N.m")
         self.vbus_var.set(f"{state['vbus']:.2f} V")
         if state["vbus_timestamp"] > 0.0:
             self.vbus_age_var.set(f"{now - state['vbus_timestamp']:.2f}s ago")
@@ -1243,18 +1362,18 @@ def parse_args():
     parser.add_argument("--rate", type=float, default=50.0, help="CAN control send rate in Hz")
     parser.add_argument("--kp", type=float, default=0.0, help=argparse.SUPPRESS)
     parser.add_argument("--kd", type=float, default=0.5, help="operation mode Kd")
-    parser.add_argument("--torque-assist", type=float, default=0.0, help="feed-forward torque limit in N.m")
     parser.add_argument("--return-time", type=float, default=SAFE_MIN_RETURN_TIME, help="seconds used to return to the startup position")
     parser.add_argument("--return-hold-time", type=float, default=0.4, help="seconds to hold the startup position before stop")
     parser.add_argument("--return-kp", type=float, default=1.0, help="Kp used for Zero and return-home motion")
     parser.add_argument("--return-kd", type=float, default=0.5, help="Kd used for Zero and return-home motion")
-    parser.add_argument("--no-return-home", action="store_true", help="disable automatic return-home on window close")
+    parser.add_argument("--return-home", action="store_true", help="re-enable automatic return-home on window close (off by default)")
     args = parser.parse_args()
+    # Return-home is disabled by default; the rest of the code reads args.no_return_home.
+    args.no_return_home = not args.return_home
     args.max_speed = clamp(abs(args.max_speed), 0.01, SAFE_MAX_SPEED)
     args.jog_speed = clamp(abs(args.jog_speed), 0.001, min(args.max_speed, SAFE_MAX_JOG_SPEED))
     args.accel = clamp(abs(args.accel), 0.01, SAFE_MAX_ACCEL)
     args.kd = clamp(args.kd, 0.0, SAFE_MAX_KD)
-    args.torque_assist = clamp(abs(args.torque_assist), 0.0, SAFE_MAX_TORQUE_ASSIST)
     args.return_time = max(SAFE_MIN_RETURN_TIME, args.return_time)
     args.return_hold_time = max(0.0, args.return_hold_time)
     args.return_kp = clamp(args.return_kp, 0.0, SAFE_MAX_RETURN_KP)
