@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import argparse
-import copy
 import collections
 import math
 import queue
@@ -18,25 +17,13 @@ DEFAULT_MOTOR_ID = 5
 DEFAULT_CHANNEL = "can0"
 DEFAULT_INTERFACE = "socketcan"
 
-P_MIN = -12.57
-P_MAX = 12.57
-V_MIN = -20.0
-V_MAX = 20.0
 KP_MIN = 0.0
-KP_MAX = 5.0
-# Protocol-correct Kp encoding scale (manual: Kp [0~65535] -> 0.0~5000.0).
-# Used only for return-home / position-hold so return_kp encodes correctly.
-RETURN_KP_MAX = 5000.0
-KD_MAX = 100.0
 KD_MIN = 0.0
-T_MIN = -60.0
-T_MAX = 60.0
 SAFE_MAX_SPEED = 2.0
 SAFE_MAX_ACCEL = 0.25
 SAFE_DEFAULT_ACCEL = 0.10
 SAFE_MAX_JOG_SPEED = 0.05
 SAFE_MAX_KD = 5.0
-SAFE_MAX_VEL_KP = 5.0
 SAFE_MAX_RETURN_SPEED = 0.20
 SAFE_MAX_POSITION_SPEED = 1.0
 SAFE_MIN_RETURN_TIME = 4.0
@@ -49,6 +36,25 @@ VBUS_INDEX = 0x701C
 MECH_POS_INDEX = 0x7019
 RUN_MODE_INDEX = 0x7005
 OPERATION_RUN_MODE = 0
+
+
+class MotorSpec:
+    def __init__(self, name, p_min, p_max, v_min, v_max, t_min, t_max, kp_max, kd_max):
+        self.name = name
+        self.p_min = p_min
+        self.p_max = p_max
+        self.v_min = v_min
+        self.v_max = v_max
+        self.t_min = t_min
+        self.t_max = t_max
+        self.kp_max = kp_max
+        self.kd_max = kd_max
+
+
+# Manual section 4.1.2 (operation control mode, Type 1 frame) encoding ranges.
+# Position range is the same for both models; velocity/torque/Kp/Kd are not.
+RS03_SPEC = MotorSpec("RS03", -12.57, 12.57, -20.0, 20.0, -60.0, 60.0, kp_max=5000.0, kd_max=100.0)
+RS02_SPEC = MotorSpec("RS02", -12.57, 12.57, -44.0, 44.0, -17.0, 17.0, kp_max=500.0, kd_max=5.0)
 
 
 def clamp(value, min_value, max_value):
@@ -71,7 +77,7 @@ def parse_arbitration_id(arbitration_id):
     return comm_type, data16, destination
 
 
-def parse_feedback(msg, host_id, motor_id):
+def parse_feedback(msg, host_id, motor_id, spec):
     if msg is None or not msg.is_extended_id:
         return None
 
@@ -92,9 +98,9 @@ def parse_feedback(msg, host_id, motor_id):
     mode_status = (data16 >> 14) & 0x03
 
     return {
-        "position": uint_to_float(raw_pos, P_MIN, P_MAX, 16),
-        "velocity": uint_to_float(raw_vel, V_MIN, V_MAX, 16),
-        "torque": uint_to_float(raw_torque, T_MIN, T_MAX, 16),
+        "position": uint_to_float(raw_pos, spec.p_min, spec.p_max, 16),
+        "velocity": uint_to_float(raw_vel, spec.v_min, spec.v_max, 16),
+        "torque": uint_to_float(raw_torque, spec.t_min, spec.t_max, 16),
         "temperature": raw_temp / 10.0,
         "fault_flags": fault_flags,
         "mode_status": mode_status,
@@ -121,11 +127,12 @@ def parse_float_parameter(msg, host_id, motor_id, index):
     return struct.unpack_from("<f", data, 4)[0]
 
 
-class RS03Motor:
-    def __init__(self, bus, motor_id, host_id):
+class Motor:
+    def __init__(self, bus, motor_id, host_id, spec):
         self.bus = bus
         self.motor_id = motor_id
         self.host_id = host_id
+        self.spec = spec
 
     def send(self, comm_type, data16, data):
         arb_id = ((comm_type & 0x1F) << 24) | ((data16 & 0xFFFF) << 8) | self.motor_id
@@ -142,7 +149,7 @@ class RS03Motor:
             if msg is None:
                 return latest
 
-            feedback = parse_feedback(msg, self.host_id, self.motor_id)
+            feedback = parse_feedback(msg, self.host_id, self.motor_id, self.spec)
             if feedback is not None:
                 latest = feedback
 
@@ -152,7 +159,7 @@ class RS03Motor:
         latest = None
         while time.monotonic() < deadline:
             msg = self.recv(timeout=0.02)
-            feedback = parse_feedback(msg, self.host_id, self.motor_id)
+            feedback = parse_feedback(msg, self.host_id, self.motor_id, self.spec)
             if feedback is not None:
                 latest = feedback
         return latest
@@ -171,12 +178,13 @@ class RS03Motor:
         self.send(0x12, self.host_id, data)
         return self.drain_feedback()
 
-    def control_operation_mode(self, pos, vel, kp, kd, torque=0.0, kp_max=KP_MAX):
-        data16 = float_to_uint(torque, T_MIN, T_MAX, 16)
-        raw_pos = float_to_uint(pos, P_MIN, P_MAX, 16)
-        raw_vel = float_to_uint(vel, V_MIN, V_MAX, 16)
-        raw_kp = float_to_uint(kp, KP_MIN, kp_max, 16)
-        raw_kd = float_to_uint(kd, KD_MIN, KD_MAX, 16)
+    def control_operation_mode(self, pos, vel, kp, kd, torque=0.0):
+        s = self.spec
+        data16 = float_to_uint(torque, s.t_min, s.t_max, 16)
+        raw_pos = float_to_uint(pos, s.p_min, s.p_max, 16)
+        raw_vel = float_to_uint(vel, s.v_min, s.v_max, 16)
+        raw_kp = float_to_uint(kp, KP_MIN, s.kp_max, 16)
+        raw_kd = float_to_uint(kd, KD_MIN, s.kd_max, 16)
 
         data = bytes(
             [
@@ -205,7 +213,7 @@ class RS03Motor:
             if msg is None:
                 break
 
-            feedback = parse_feedback(msg, self.host_id, self.motor_id)
+            feedback = parse_feedback(msg, self.host_id, self.motor_id, self.spec)
             if feedback is not None:
                 latest_feedback = feedback
                 continue
@@ -221,6 +229,7 @@ class MotorController(threading.Thread):
     def __init__(self, args, event_queue):
         super().__init__(daemon=True)
         self.args = args
+        self.spec = args.spec
         self.event_queue = event_queue
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
@@ -240,7 +249,6 @@ class MotorController(threading.Thread):
         self.target_velocity = 0.0
         self.command_velocity = 0.0
         self.accel_limit = args.accel
-        self.kp = args.kp
         self.kd = args.kd
         self.return_kp = args.return_kp
         self.return_kd = args.return_kd
@@ -276,10 +284,6 @@ class MotorController(threading.Thread):
     def set_accel_limit(self, value):
         with self.lock:
             self.accel_limit = clamp(float(value), 0.01, SAFE_MAX_ACCEL)
-
-    def set_kp(self, value):
-        with self.lock:
-            self.kp = clamp(float(value), 0.0, SAFE_MAX_VEL_KP)
 
     def set_kd(self, value):
         with self.lock:
@@ -326,7 +330,7 @@ class MotorController(threading.Thread):
 
     def request_move_to(self, target_position):
         with self.lock:
-            self.pending_move_to = clamp(float(target_position), P_MIN, P_MAX)
+            self.pending_move_to = clamp(float(target_position), self.spec.p_min, self.spec.p_max)
             self.target_velocity = 0.0
             self.command_velocity = 0.0
             self.position_hold_target = None
@@ -494,7 +498,7 @@ class MotorController(threading.Thread):
             self.publish_status("Position unknown")
             return False
 
-        target_position = max(P_MIN, min(P_MAX, target_position))
+        target_position = max(self.spec.p_min, min(self.spec.p_max, target_position))
         travel = target_position - start_position
         distance = abs(travel)
         return_time = max(SAFE_MIN_RETURN_TIME, self.args.return_time)
@@ -540,7 +544,6 @@ class MotorController(threading.Thread):
                 kp=return_kp,
                 kd=return_kd,
                 torque=0.0,
-                kp_max=RETURN_KP_MAX,
             )
             dt = max(1e-4, now - last_time)
             last_time = now
@@ -570,7 +573,6 @@ class MotorController(threading.Thread):
                 kp=return_kp,
                 kd=return_kd,
                 torque=0.0,
-                kp_max=RETURN_KP_MAX,
             )
             self.publish_feedback(feedback, now, 0.0)
             if self.stop_on_overspeed(motor, feedback):
@@ -629,9 +631,7 @@ class MotorController(threading.Thread):
         self.stop_event.set()
 
     def make_motor(self, bus):
-        # Seam so subclasses (e.g. daisy-chain with per-model encoding) can swap
-        # in a spec-aware motor class. Default keeps single-motor RS03 behavior.
-        return RS03Motor(bus=bus, motor_id=self.args.motor_id, host_id=self.args.host_id)
+        return Motor(bus=bus, motor_id=self.args.motor_id, host_id=self.args.host_id, spec=self.spec)
 
     def run(self):
         bus = None
@@ -665,7 +665,6 @@ class MotorController(threading.Thread):
                     shutdown_return_home = self.shutdown_return_home
                     target_velocity = clamp(self.target_velocity, -self.args.max_speed, self.args.max_speed)
                     accel_limit = clamp(self.accel_limit, 0.01, SAFE_MAX_ACCEL)
-                    kp = clamp(self.kp, 0.0, SAFE_MAX_VEL_KP)
                     kd = clamp(self.kd, 0.0, SAFE_MAX_KD)
                     self.pending_enable = False
                     self.pending_stop = False
@@ -737,7 +736,6 @@ class MotorController(threading.Thread):
                             kp=clamp(self.return_kp, 0.0, SAFE_MAX_RETURN_KP),
                             kd=clamp(self.return_kd, 0.0, SAFE_MAX_RETURN_KD),
                             torque=0.0,
-                            kp_max=RETURN_KP_MAX,
                         )
                     else:
                         delta = target_velocity - self.command_velocity
@@ -751,10 +749,13 @@ class MotorController(threading.Thread):
                             -self.args.max_speed,
                             self.args.max_speed,
                         )
+                        # Kp is always 0 here: `pos` below is just the last-known
+                        # actual position, not a real setpoint, so a nonzero Kp
+                        # would fight a stale/lagged error and amplify (runaway).
                         feedback = motor.control_operation_mode(
                             pos=self.current_position(),
                             vel=self.command_velocity,
-                            kp=kp,
+                            kp=0.0,
                             kd=kd,
                             torque=0.0,
                         )
@@ -820,7 +821,7 @@ class GraphCanvas(tk.Canvas):
         self.delete("all")
         width = max(1, self.winfo_width())
         height = max(1, self.winfo_height())
-        margin_left = 96
+        margin_left = 116
         margin_right = 18
         panel_gap = 20
         top = 24
@@ -901,317 +902,251 @@ def mode_status_name(mode_status):
     return names.get(mode_status, "Unknown")
 
 
-class MotorRunApp:
-    def __init__(self, root, args):
-        self.root = root
-        self.args = args
-        self.current_motor_id = args.motor_id
+def make_controller_args(channel, interface, motor_id, spec, host_id=HOST_ID, **overrides):
+    args = argparse.Namespace(
+        channel=channel,
+        interface=interface,
+        motor_id=motor_id,
+        host_id=host_id,
+        spec=spec,
+        max_speed=clamp(SAFE_MAX_SPEED, 0.01, SAFE_MAX_SPEED),
+        jog_speed=0.05,
+        accel=SAFE_DEFAULT_ACCEL,
+        rate=50.0,
+        kd=0.5,
+        return_time=SAFE_MIN_RETURN_TIME,
+        return_hold_time=0.4,
+        return_kp=1.0,
+        return_kd=0.5,
+        move_speed=min(0.3, SAFE_MAX_POSITION_SPEED),
+        no_return_home=True,
+    )
+    for key, value in overrides.items():
+        setattr(args, key, value)
+    return args
+
+
+class MotorPanel:
+    """One motor's graph, live state, and controls (Velocity + Position tabs), bound to its own controller thread."""
+
+    def __init__(self, parent, title, spec, channel, interface, default_id, id_editable=True,
+                 host_id=HOST_ID, available_specs=None):
+        self.spec = spec
+        self.available_specs = {s.name: s for s in (available_specs or [RS02_SPEC, RS03_SPEC])}
+        self.channel = channel
+        self.interface = interface
+        self.id_editable = id_editable
+        self.host_id = host_id
         self.events = queue.Queue()
         self.controller = None
+        self.current_motor_id = default_id
         self.closing = False
         self.close_started_at = 0.0
 
-        self.root.title("RS03 Motor Run")
-        self.root.geometry("1120x680")
-        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.frame = ttk.LabelFrame(parent, text=title, padding=8)
 
-        self.motor_id_var = tk.StringVar(value=str(args.motor_id))
-        self.active_motor_id_var = tk.StringVar(value=str(args.motor_id))
+        self.model_var = tk.StringVar(value=spec.name)
+        self.motor_id_var = tk.StringVar(value=str(default_id) if default_id is not None else "")
         self.velocity_var = tk.DoubleVar(value=0.0)
-        self.accel_var = tk.DoubleVar(value=args.accel)
-        self.kd_var = tk.DoubleVar(value=args.kd)
-        self.kp_var = tk.DoubleVar(value=args.kp)
+        self.accel_var = tk.DoubleVar(value=SAFE_DEFAULT_ACCEL)
+        self.kd_var = tk.DoubleVar(value=0.5)
         self.target_angle_var = tk.StringVar(value="0.0")
-        self.return_kp_var = tk.DoubleVar(value=args.return_kp)
-        self.return_kd_var = tk.DoubleVar(value=args.return_kd)
-        self.move_speed_var = tk.DoubleVar(value=getattr(args, "move_speed", SAFE_MAX_POSITION_SPEED))
+        self.move_speed_var = tk.DoubleVar(value=min(0.3, SAFE_MAX_POSITION_SPEED))
+        self.return_kp_var = tk.DoubleVar(value=1.0)
+        self.return_kd_var = tk.DoubleVar(value=0.5)
 
-        self.status_var = tk.StringVar(value="Starting...")
+        self.status_var = tk.StringVar(value="Idle")
+        self.active_id_var = tk.StringVar(value="-")
         self.feedback_var = tk.StringVar(value="none")
         self.position_var = tk.StringVar(value="0.000 rad / 0.00 deg")
         self.home_var = tk.StringVar(value="unknown")
         self.velocity_read_var = tk.StringVar(value="0.000 rad/s")
-        self.accel_read_var = tk.StringVar(value="0.000 rad/s^2")
-        self.command_var = tk.StringVar(value="0.000 rad/s")
         self.target_var = tk.StringVar(value="0.000 rad/s")
         self.vbus_var = tk.StringVar(value="0.00 V")
-        self.vbus_age_var = tk.StringVar(value="none")
-        self.torque_var = tk.StringVar(value="0.00 N.m")
+        self.torque_var = tk.StringVar(value="0.000 N.m")
         self.temp_var = tk.StringVar(value="0.0 deg C")
-        self.mode_var = tk.StringVar(value="Unknown")
+        self.mode_var = tk.StringVar(value="-")
         self.fault_var = tk.StringVar(value="0x00")
-        self.slider_value_vars = []
-        self.splitter = None
 
-        self.build_ui()
-        self.bind_keys()
-        self.start_controller(args.motor_id)
-        self.update_loop()
+        self._build()
 
-    def start_controller(self, motor_id):
-        controller_args = copy.copy(self.args)
-        controller_args.motor_id = motor_id
-        controller_args.accel = self.accel_var.get()
-        controller_args.kp = self.kp_var.get()
-        controller_args.kd = self.kd_var.get()
-        controller_args.return_kp = self.return_kp_var.get()
-        controller_args.return_kd = self.return_kd_var.get()
-        controller_args.move_speed = self.move_speed_var.get()
-        self.current_motor_id = motor_id
-        self.controller = MotorController(controller_args, self.events)
-        self.controller.start()
+    def _build(self):
+        self.graph = GraphCanvas(self.frame, width=360, height=300)
+        self.graph.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
 
-    def restart_controller(self, motor_id):
-        if self.controller is not None:
-            self.controller.shutdown(return_home=False)
-            self.controller.join(timeout=1.5)
-            if self.controller.is_alive():
-                self.controller.force_shutdown()
-                self.controller.join(timeout=0.5)
-
-        self.set_velocity(0.0, send=False)
-        self.graph.reset()
-        self.start_controller(motor_id)
-
-    def apply_motor_id(self):
-        try:
-            motor_id = int(self.motor_id_var.get(), 0)
-        except ValueError:
-            messagebox.showerror("Invalid Motor ID", "Motor ID must be a number, e.g. 4 or 0x04.")
-            self.motor_id_var.set(str(self.current_motor_id))
-            return
-
-        if not 0 <= motor_id <= 127:
-            messagebox.showerror("Invalid Motor ID", "Motor ID must be between 0 and 127.")
-            self.motor_id_var.set(str(self.current_motor_id))
-            return
-
-        if motor_id == self.current_motor_id:
-            return
-
-        self.restart_controller(motor_id)
-
-    def build_ui(self):
-        main = ttk.Frame(self.root, padding=10)
-        main.pack(fill=tk.BOTH, expand=True)
-
-        self.splitter = tk.PanedWindow(
-            main,
-            orient=tk.HORIZONTAL,
-            sashwidth=8,
-            sashrelief=tk.RAISED,
-            showhandle=True,
-            handlepad=8,
-            handlesize=12,
-            bd=0,
-            bg="#2C3138",
+        device = ttk.Frame(self.frame)
+        device.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(device, text="Model", width=6).pack(side=tk.LEFT)
+        model_box = ttk.Combobox(
+            device, textvariable=self.model_var, values=list(self.available_specs.keys()),
+            state="readonly", width=5,
         )
-        self.splitter.pack(fill=tk.BOTH, expand=True)
+        model_box.pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Label(device, text="ID", width=3).pack(side=tk.LEFT)
+        entry = ttk.Entry(device, textvariable=self.motor_id_var, width=5)
+        entry.pack(side=tk.LEFT)
+        if not self.id_editable:
+            entry.configure(state="readonly")
+        ttk.Button(device, text="Connect", command=self.apply_motor_id).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Label(device, text=self.channel).pack(side=tk.LEFT, padx=(8, 0))
 
-        left = ttk.Frame(self.splitter)
-        self.splitter.add(left, minsize=520, stretch="always")
+        state = ttk.LabelFrame(self.frame, text="Live State", padding=6)
+        state.pack(fill=tk.X, pady=(0, 6))
+        for label, var in [
+            ("Status", self.status_var),
+            ("Motor ID", self.active_id_var),
+            ("Feedback", self.feedback_var),
+            ("Position", self.position_var),
+            ("Home", self.home_var),
+            ("Velocity", self.velocity_read_var),
+            ("Target", self.target_var),
+            ("VBUS", self.vbus_var),
+            ("Torque", self.torque_var),
+            ("Temp", self.temp_var),
+            ("Mode", self.mode_var),
+            ("Fault", self.fault_var),
+        ]:
+            row = ttk.Frame(state)
+            row.pack(fill=tk.X, pady=1)
+            ttk.Label(row, text=label, width=10).pack(side=tk.LEFT)
+            ttk.Label(row, textvariable=var, anchor="w").pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-        self.graph = GraphCanvas(left, width=760, height=620)
-        self.graph.pack(fill=tk.BOTH, expand=True)
+        buttons = ttk.Frame(self.frame)
+        buttons.pack(fill=tk.X, pady=(0, 6))
+        ttk.Button(buttons, text="Enable", command=self.enable).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(buttons, text="Stop", command=self.stop).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 0))
+        ttk.Button(buttons, text="Clear Fault", command=self.clear_fault).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 0))
 
-        right = ttk.Frame(self.splitter, padding=(12, 0, 0, 0), width=760)
-        self.splitter.add(right, minsize=520, stretch="never")
-        self.root.after(100, self.set_initial_split)
+        notebook = ttk.Notebook(self.frame)
+        notebook.pack(fill=tk.X)
 
-        device_frame = ttk.LabelFrame(right, text="Device", padding=10)
-        device_frame.pack(fill=tk.X, pady=(0, 10))
-        id_row = ttk.Frame(device_frame)
-        id_row.pack(fill=tk.X)
-        ttk.Label(id_row, text="Motor ID", width=12).pack(side=tk.LEFT)
-        ttk.Entry(id_row, textvariable=self.motor_id_var, width=8).pack(side=tk.LEFT, fill=tk.X, expand=True)
-        ttk.Button(id_row, text="Apply", command=self.apply_motor_id).pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Label(device_frame, text=f"{self.args.channel} / {self.args.interface}").pack(anchor="w", pady=(6, 0))
+        velocity_tab = ttk.Frame(notebook, padding=6)
+        notebook.add(velocity_tab, text="Velocity")
+        self._slider(velocity_tab, "Target velocity (rad/s)", self.velocity_var,
+                     -SAFE_MAX_SPEED, SAFE_MAX_SPEED, self.on_velocity)
+        self._slider(velocity_tab, "Accel limit (rad/s^2)", self.accel_var,
+                     0.01, SAFE_MAX_ACCEL, self.on_accel)
+        self._slider(velocity_tab, "Kd", self.kd_var, 0.0, SAFE_MAX_KD, self.on_kd)
 
-        status_frame = ttk.LabelFrame(right, text="Live State", padding=10)
-        status_frame.pack(fill=tk.X, pady=(0, 10))
-        self.add_value(status_frame, "Status", self.status_var)
-        self.add_value(status_frame, "Motor ID", self.active_motor_id_var)
-        self.add_value(status_frame, "Feedback", self.feedback_var)
-        self.add_value(status_frame, "Position", self.position_var)
-        self.add_value(status_frame, "Home", self.home_var)
-        self.add_value(status_frame, "Velocity", self.velocity_read_var)
-        self.add_value(status_frame, "Accel est.", self.accel_read_var)
-        self.add_value(status_frame, "Target", self.target_var)
-        self.add_value(status_frame, "Command", self.command_var)
-        self.add_value(status_frame, "VBUS", self.vbus_var)
-        self.add_value(status_frame, "VBUS age", self.vbus_age_var)
-        self.add_value(status_frame, "Torque", self.torque_var)
-        self.add_value(status_frame, "Temp", self.temp_var)
-        self.add_value(status_frame, "Mode", self.mode_var)
-        self.add_value(status_frame, "Fault", self.fault_var)
+        jog = ttk.Frame(velocity_tab)
+        jog.pack(fill=tk.X, pady=(6, 0))
+        ttk.Button(jog, text="- Jog", command=lambda: self.adjust(-0.05)).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(jog, text="Zero vel", command=lambda: self.set_velocity(0.0)).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
+        ttk.Button(jog, text="+ Jog", command=lambda: self.adjust(0.05)).pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-        # Common motor buttons -- apply in both test modes.
-        button_frame = ttk.Frame(right)
-        button_frame.pack(fill=tk.X, pady=(0, 8))
-        ttk.Button(button_frame, text="Enable", command=self.enable_motor).pack(side=tk.LEFT, fill=tk.X, expand=True)
-        ttk.Button(button_frame, text="Stop", command=self.stop_motor).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
-        ttk.Button(button_frame, text="Clear Fault", command=self.clear_fault).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
-
-        notebook = ttk.Notebook(right)
-        notebook.pack(fill=tk.X, pady=(0, 10))
-
-        # --- Speed control test ---
-        speed_tab = ttk.Frame(notebook, padding=10)
-        notebook.add(speed_tab, text="Speed test")
-        self.add_slider(
-            speed_tab,
-            "Target velocity (rad/s)",
-            self.velocity_var,
-            -abs(self.args.max_speed),
-            abs(self.args.max_speed),
-            self.on_velocity_change,
-        )
-        self.add_slider(speed_tab, "Accel limit (rad/s^2)", self.accel_var, 0.01, SAFE_MAX_ACCEL, self.on_accel_change)
-        self.add_slider(speed_tab, "Kp", self.kp_var, 0.0, SAFE_MAX_VEL_KP, self.on_kp_change)
-        self.add_slider(speed_tab, "Kd", self.kd_var, 0.0, SAFE_MAX_KD, self.on_kd_change)
-
-        jog_frame = ttk.Frame(speed_tab)
-        jog_frame.pack(fill=tk.X, pady=(8, 0))
-        ttk.Button(jog_frame, text="- Jog", command=lambda: self.adjust_velocity(-abs(self.args.jog_speed))).pack(
-            side=tk.LEFT, fill=tk.X, expand=True
-        )
-        ttk.Button(jog_frame, text="Zero", command=self.zero_position).pack(
-            side=tk.LEFT, fill=tk.X, expand=True, padx=8
-        )
-        ttk.Button(jog_frame, text="+ Jog", command=lambda: self.adjust_velocity(abs(self.args.jog_speed))).pack(
-            side=tk.LEFT, fill=tk.X, expand=True
-        )
-
-        # --- Position control test ---
-        position_tab = ttk.Frame(notebook, padding=10)
-        notebook.add(position_tab, text="Position test")
+        position_tab = ttk.Frame(notebook, padding=6)
+        notebook.add(position_tab, text="Position")
         angle_row = ttk.Frame(position_tab)
         angle_row.pack(fill=tk.X)
-        ttk.Label(angle_row, text="Target angle (deg)", width=18).pack(side=tk.LEFT)
-        angle_entry = ttk.Entry(angle_row, textvariable=self.target_angle_var, width=10, justify=tk.RIGHT)
+        ttk.Label(angle_row, text="Target angle (deg)", width=15).pack(side=tk.LEFT)
+        angle_entry = ttk.Entry(angle_row, textvariable=self.target_angle_var, width=8, justify=tk.RIGHT)
         angle_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
         angle_entry.bind("<Return>", lambda _event: self.go_to_angle())
-        ttk.Button(angle_row, text="Go", command=self.go_to_angle).pack(side=tk.LEFT, padx=(8, 0))
-        self.add_slider(position_tab, "Move speed (rad/s)", self.move_speed_var, 0.01, SAFE_MAX_POSITION_SPEED, self.on_move_speed_change)
-        self.add_slider(position_tab, "Position Kp", self.return_kp_var, 0.0, SAFE_MAX_RETURN_KP, self.on_return_kp_change)
-        self.add_slider(position_tab, "Position Kd", self.return_kd_var, 0.0, SAFE_MAX_RETURN_KD, self.on_return_kd_change)
-        ttk.Label(
-            position_tab,
-            text="Enable first, then Go. Moves smoothly to the angle and holds it. "
-            "Raise Position Kp until it overcomes friction.",
-            justify=tk.LEFT,
-            wraplength=320,
-            foreground="#7E8A97",
-        ).pack(anchor="w", pady=(6, 0))
+        ttk.Button(angle_row, text="Go", command=self.go_to_angle).pack(side=tk.LEFT, padx=(6, 0))
+        self._slider(position_tab, "Move speed (rad/s)", self.move_speed_var,
+                     0.01, SAFE_MAX_POSITION_SPEED, self.on_move_speed)
+        self._slider(position_tab, "Position Kp", self.return_kp_var, 0.0, SAFE_MAX_RETURN_KP, self.on_return_kp)
+        self._slider(position_tab, "Position Kd", self.return_kd_var, 0.0, SAFE_MAX_RETURN_KD, self.on_return_kd)
 
-        hint = ttk.LabelFrame(right, text="Keys", padding=10)
-        hint.pack(fill=tk.X)
-        ttk.Label(
-            hint,
-            text="a / left: decrease jog\n"
-            "d / right: increase jog\n"
-            "space: zero velocity\n"
-            "Esc: stop motor",
-            justify=tk.LEFT,
-        ).pack(anchor="w")
-
-    def set_initial_split(self):
-        if self.splitter is None:
-            return
-
-        width = self.splitter.winfo_width()
-        if width <= 1:
-            self.root.after(100, self.set_initial_split)
-            return
-
-        desired_right_width = int(width * 0.44)
-        min_left_width = 520
-        min_right_width = 520
-        max_right_width = 920
-        desired_right_width = min(max(desired_right_width, min_right_width), max_right_width)
-        max_sash_x = max(0, width - min_right_width)
-        sash_x = min(max(min_left_width, width - desired_right_width), max_sash_x)
-        self.splitter.sash_place(0, sash_x, 0)
-
-    def add_value(self, parent, label, variable):
-        row = ttk.Frame(parent)
-        row.pack(fill=tk.X, pady=2)
-        ttk.Label(row, text=label, width=12).pack(side=tk.LEFT)
-        ttk.Label(row, textvariable=variable, anchor="w").pack(side=tk.LEFT, fill=tk.X, expand=True)
-
-    def add_slider(self, parent, label, variable, min_value, max_value, command):
+    def _slider(self, parent, label, variable, lo, hi, command):
         frame = ttk.Frame(parent)
-        frame.pack(fill=tk.X, pady=(6, 0))
+        frame.pack(fill=tk.X, pady=(4, 0))
         ttk.Label(frame, text=label).pack(anchor="w")
         value_text = tk.StringVar(value=f"{variable.get():.3f}")
-        self.slider_value_vars.append(value_text)
 
-        def refresh_label(*_args):
+        def refresh(*_):
             value_text.set(f"{variable.get():.3f}")
 
-        variable.trace_add("write", refresh_label)
-
+        variable.trace_add("write", refresh)
         row = ttk.Frame(frame)
         row.pack(fill=tk.X)
-        slider = ttk.Scale(row, from_=min_value, to=max_value, variable=variable, command=lambda _value: command())
-        slider.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Scale(row, from_=lo, to=hi, variable=variable,
+                  command=lambda _v: command()).pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-        def apply_entry(*_args):
+        def apply_entry(*_):
             try:
                 value = float(value_text.get())
             except ValueError:
                 value_text.set(f"{variable.get():.3f}")
                 return
-            value = max(min_value, min(max_value, value))
-            variable.set(value)
+            variable.set(max(lo, min(hi, value)))
             command()
 
-        entry = ttk.Entry(row, textvariable=value_text, width=9, justify=tk.RIGHT)
-        entry.pack(side=tk.LEFT, padx=(8, 0))
+        entry = ttk.Entry(row, textvariable=value_text, width=8, justify=tk.RIGHT)
+        entry.pack(side=tk.LEFT, padx=(6, 0))
         entry.bind("<Return>", apply_entry)
         entry.bind("<FocusOut>", apply_entry)
 
-    def bind_keys(self):
-        self.root.bind("<Left>", lambda _event: self.adjust_velocity(-abs(self.args.jog_speed)))
-        self.root.bind("<Right>", lambda _event: self.adjust_velocity(abs(self.args.jog_speed)))
-        self.root.bind("a", lambda _event: self.adjust_velocity(-abs(self.args.jog_speed)))
-        self.root.bind("d", lambda _event: self.adjust_velocity(abs(self.args.jog_speed)))
-        self.root.bind("<space>", lambda _event: self.set_velocity(0.0))
-        self.root.bind("<Escape>", lambda _event: self.stop_motor())
+    def apply_motor_id(self):
+        raw = self.motor_id_var.get().strip()
+        if not raw:
+            messagebox.showerror("Motor ID", f"{self.model_var.get()}: enter a motor ID first.")
+            return
+        try:
+            motor_id = int(raw, 0)
+        except ValueError:
+            messagebox.showerror("Motor ID", "Motor ID must be a number, e.g. 2 or 0x02.")
+            return
+        if not 0 <= motor_id <= 127:
+            messagebox.showerror("Motor ID", "Motor ID must be between 0 and 127.")
+            return
+        self.spec = self.available_specs[self.model_var.get()]
+        self._stop_controller()
+        self.set_velocity(0.0, send=False)
+        self.graph.reset()
+        self.current_motor_id = motor_id
+        args = make_controller_args(
+            self.channel, self.interface, motor_id, self.spec, host_id=self.host_id,
+            accel=self.accel_var.get(),
+            kd=self.kd_var.get(),
+            return_kp=self.return_kp_var.get(),
+            return_kd=self.return_kd_var.get(),
+            move_speed=self.move_speed_var.get(),
+        )
+        self.controller = MotorController(args, self.events)
+        self.controller.start()
+
+    def _stop_controller(self, return_home=False):
+        if self.controller is not None:
+            self.controller.shutdown(return_home=return_home)
+            self.controller.join(timeout=1.5)
+            if self.controller.is_alive():
+                self.controller.force_shutdown()
+                self.controller.join(timeout=0.5)
+            self.controller = None
 
     def set_velocity(self, value, send=True):
-        value = max(-abs(self.args.max_speed), min(abs(self.args.max_speed), float(value)))
+        value = max(-SAFE_MAX_SPEED, min(SAFE_MAX_SPEED, float(value)))
         self.velocity_var.set(value)
         if send and self.controller is not None:
             self.controller.set_target_velocity(value)
 
-    def adjust_velocity(self, delta):
-        self.set_velocity(self.velocity_var.get() + float(delta))
-
-    def zero_position(self):
-        self.set_velocity(0.0)
-        if self.controller is not None:
-            self.controller.request_zero_position()
+    def adjust(self, delta):
+        self.set_velocity(self.velocity_var.get() + delta)
 
     def go_to_angle(self):
         try:
             angle_deg = float(self.target_angle_var.get())
         except ValueError:
-            messagebox.showerror("Invalid angle", "Target angle must be a number in degrees.")
+            messagebox.showerror("Invalid angle", f"{self.spec.name}: target angle must be a number in degrees.")
             return
         target_rad = math.radians(angle_deg)
-        clamped = clamp(target_rad, P_MIN, P_MAX)
+        clamped = clamp(target_rad, self.spec.p_min, self.spec.p_max)
         if abs(clamped - target_rad) > 1e-9:
             self.target_angle_var.set(f"{math.degrees(clamped):.1f}")
-        self.set_velocity(0.0)
-        if self.controller is not None:
-            self.controller.request_move_to(clamped)
+        self.set_velocity(0.0, send=False)
+        if self.controller is None:
+            messagebox.showinfo("Not connected", f"{self.spec.name}: press Connect first.")
+            return
+        self.controller.request_move_to(clamped)
 
-    def enable_motor(self):
-        if self.controller is not None:
-            self.controller.request_enable()
+    def enable(self):
+        if self.controller is None:
+            messagebox.showinfo("Not connected", f"{self.spec.name}: press Connect first.")
+            return
+        self.controller.request_enable()
 
-    def stop_motor(self):
+    def stop(self):
         self.set_velocity(0.0)
         if self.controller is not None:
             self.controller.request_stop()
@@ -1220,181 +1155,152 @@ class MotorRunApp:
         if self.controller is not None:
             self.controller.request_clear_fault()
 
-    def on_velocity_change(self):
+    def on_velocity(self):
         if self.controller is not None:
             self.controller.set_target_velocity(self.velocity_var.get())
 
-    def on_accel_change(self):
+    def on_accel(self):
         if self.controller is not None:
             self.controller.set_accel_limit(self.accel_var.get())
 
-    def on_kp_change(self):
-        if self.controller is not None:
-            self.controller.set_kp(self.kp_var.get())
-
-    def on_kd_change(self):
+    def on_kd(self):
         if self.controller is not None:
             self.controller.set_kd(self.kd_var.get())
 
-    def on_return_kp_change(self):
-        if self.controller is not None:
-            self.controller.set_return_kp(self.return_kp_var.get())
-
-    def on_return_kd_change(self):
-        if self.controller is not None:
-            self.controller.set_return_kd(self.return_kd_var.get())
-
-    def on_move_speed_change(self):
+    def on_move_speed(self):
         if self.controller is not None:
             self.controller.set_move_speed(self.move_speed_var.get())
 
-    def update_loop(self):
-        self.handle_events()
-        if self.controller is None:
-            self.root.after(50, self.update_loop)
-            return
-        state = self.controller.snapshot()
-        self.graph.add_sample(state)
-        self.graph.redraw()
-        self.update_labels(state)
-        self.root.after(50, self.update_loop)
+    def on_return_kp(self):
+        if self.controller is not None:
+            self.controller.set_return_kp(self.return_kp_var.get())
 
-    def handle_events(self):
+    def on_return_kd(self):
+        if self.controller is not None:
+            self.controller.set_return_kd(self.return_kd_var.get())
+
+    def tick(self):
         while True:
             try:
                 event_type, message = self.events.get_nowait()
             except queue.Empty:
-                return
+                break
             if event_type == "error":
-                messagebox.showerror("Motor Run Error", message)
+                messagebox.showerror(f"{self.spec.name} error", message)
+        if self.controller is None:
+            return
+        state = self.controller.snapshot()
+        self.graph.add_sample(state)
+        self.graph.redraw()
+        self._update_labels(state)
 
-    def update_labels(self, state):
+    def _update_labels(self, state):
         now = time.monotonic()
-        position_deg = math.degrees(state["position"])
         self.status_var.set(state["status"])
-        self.active_motor_id_var.set(str(state["motor_id"]))
+        self.active_id_var.set(str(state["motor_id"]))
         if state["feedback_timestamp"] > 0.0:
             self.feedback_var.set(f"{state['feedback_count']} frames, {now - state['feedback_timestamp']:.2f}s ago")
         else:
             self.feedback_var.set("none")
-        self.position_var.set(f"{state['position']:+.6f} rad / {position_deg:+.2f} deg")
+        self.position_var.set(f"{state['position']:+.4f} rad / {math.degrees(state['position']):+.2f} deg")
         if state["initial_position"] is None:
             self.home_var.set("unknown")
         else:
-            home_deg = math.degrees(state["initial_position"])
-            self.home_var.set(f"{state['initial_position']:+.6f} rad / {home_deg:+.2f} deg")
+            self.home_var.set(f"{state['initial_position']:+.4f} rad / {math.degrees(state['initial_position']):+.2f} deg")
         self.velocity_read_var.set(f"{state['velocity']:+.4f} rad/s")
-        self.accel_read_var.set(f"{state['acceleration']:+.4f} rad/s^2")
         self.target_var.set(f"{state['target_velocity']:+.4f} rad/s")
-        self.command_var.set(f"{state['command_velocity']:+.4f} rad/s")
         self.vbus_var.set(f"{state['vbus']:.2f} V")
-        if state["vbus_timestamp"] > 0.0:
-            self.vbus_age_var.set(f"{now - state['vbus_timestamp']:.2f}s ago")
-        else:
-            self.vbus_age_var.set("none")
         self.torque_var.set(f"{state['torque']:+.3f} N.m")
         self.temp_var.set(f"{state['temperature']:.1f} deg C")
         self.mode_var.set(f"{state['mode_status']} ({mode_status_name(state['mode_status'])})")
         self.fault_var.set(f"0x{state['fault_flags']:02X}")
 
+    def shutdown(self):
+        self._stop_controller(return_home=False)
+
+
+class MotorRunApp:
+    """Top-level window hosting one or more MotorPanels side by side."""
+
+    def __init__(self, root, args):
+        self.root = root
+        self.closing = False
+        root.title(args.window_title)
+        root.geometry(args.geometry)
+        root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+        container = ttk.Frame(root, padding=10)
+        container.pack(fill=tk.BOTH, expand=True)
+        for col in range(len(args.panels)):
+            container.columnconfigure(col, weight=1, uniform="motor")
+        container.rowconfigure(0, weight=1)
+
+        self.panels = []
+        for i, panel_cfg in enumerate(args.panels):
+            panel = MotorPanel(
+                container,
+                panel_cfg["title"],
+                panel_cfg["spec"],
+                args.channel,
+                args.interface,
+                default_id=panel_cfg["default_id"],
+                id_editable=panel_cfg.get("id_editable", True),
+                host_id=args.host_id,
+            )
+            left_pad = 0 if i == 0 else 6
+            right_pad = 6 if i < len(args.panels) - 1 else 0
+            panel.frame.grid(row=0, column=i, sticky="nsew", padx=(left_pad, right_pad))
+            self.panels.append(panel)
+
+        if len(self.panels) == 1:
+            self.bind_keys(self.panels[0])
+
+        self.update_loop()
+
+    def bind_keys(self, panel):
+        self.root.bind("<Left>", lambda _event: panel.adjust(-0.05))
+        self.root.bind("<Right>", lambda _event: panel.adjust(0.05))
+        self.root.bind("a", lambda _event: panel.adjust(-0.05))
+        self.root.bind("d", lambda _event: panel.adjust(0.05))
+        self.root.bind("<space>", lambda _event: panel.set_velocity(0.0))
+        self.root.bind("<Escape>", lambda _event: panel.stop())
+
+    def update_loop(self):
+        for panel in self.panels:
+            panel.tick()
+        self.root.after(50, self.update_loop)
+
     def on_close(self):
         if self.closing:
             return
-
         self.closing = True
-        self.close_started_at = time.monotonic()
         self.root.protocol("WM_DELETE_WINDOW", lambda: None)
-        self.set_velocity(0.0)
-
-        if self.controller is None:
-            self.root.destroy()
-            return
-
-        self.controller.shutdown(return_home=not self.args.no_return_home)
-        self.root.after(100, self.finish_close)
-
-    def finish_close(self):
-        if self.controller is None:
-            self.root.destroy()
-            return
-
-        state = self.controller.snapshot()
-        self.graph.add_sample(state)
-        self.graph.redraw()
-        self.update_labels(state)
-        self.handle_events()
-
-        close_timeout = SAFE_CLOSE_TIMEOUT
-        if self.controller.is_alive() and time.monotonic() - self.close_started_at <= close_timeout:
-            self.root.after(100, self.finish_close)
-            return
-
-        if self.controller.is_alive():
-            self.controller.force_shutdown()
-            self.controller.join(timeout=0.8)
-
+        for panel in self.panels:
+            panel.shutdown()
         self.root.destroy()
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="GUI speed control and live plotting for an RS03 motor.")
+    parser = argparse.ArgumentParser(description="GUI speed/position control and live plotting for a single motor.")
     parser.add_argument("--channel", default=DEFAULT_CHANNEL, help="CAN channel, default: can0")
-    parser.add_argument(
-        "--interface",
-        default=DEFAULT_INTERFACE,
-        help="python-can interface, default: socketcan",
-    )
-    parser.add_argument(
-        "--motor-id",
-        type=lambda value: int(value, 0),
-        default=DEFAULT_MOTOR_ID,
-        help="RS03 motor CAN ID, default: %(default)s",
-    )
-    parser.add_argument(
-        "--host-id",
-        type=lambda value: int(value, 0),
-        default=HOST_ID,
-        help="host CAN ID used in the private protocol, default: 0xFD",
-    )
-    parser.add_argument("--max-speed", type=float, default=SAFE_MAX_SPEED, help="GUI velocity slider limit in rad/s")
-    parser.add_argument("--jog-speed", type=float, default=0.05, help="velocity increment per jog in rad/s")
-    parser.add_argument("--accel", type=float, default=SAFE_DEFAULT_ACCEL, help="initial acceleration limit in rad/s^2")
-    parser.add_argument("--rate", type=float, default=50.0, help="CAN control send rate in Hz")
-    parser.add_argument("--kp", type=float, default=0.0, help=argparse.SUPPRESS)
-    parser.add_argument("--kd", type=float, default=0.5, help="operation mode Kd")
-    parser.add_argument("--return-time", type=float, default=SAFE_MIN_RETURN_TIME, help="seconds used to return to the startup position")
-    parser.add_argument("--return-hold-time", type=float, default=0.4, help="seconds to hold the startup position before stop")
-    parser.add_argument("--return-kp", type=float, default=1.0, help="Kp used for Zero and return-home motion")
-    parser.add_argument("--return-kd", type=float, default=0.5, help="Kd used for Zero and return-home motion")
-    parser.add_argument("--return-home", action="store_true", help="re-enable automatic return-home on window close (off by default)")
+    parser.add_argument("--interface", default=DEFAULT_INTERFACE, help="python-can interface, default: socketcan")
+    parser.add_argument("--model", choices=["rs02", "rs03"], default="rs03",
+                         help="motor model -- selects the Kp/Kd/velocity/torque encoding ranges, default: rs03")
+    parser.add_argument("--motor-id", type=lambda v: int(v, 0), default=DEFAULT_MOTOR_ID, help="motor CAN ID, default: %(default)s")
+    parser.add_argument("--host-id", type=lambda v: int(v, 0), default=HOST_ID, help="host CAN ID used in the private protocol, default: 0xFD")
     args = parser.parse_args()
-    # Return-home is disabled by default; the rest of the code reads args.no_return_home.
-    args.no_return_home = not args.return_home
-    args.max_speed = clamp(abs(args.max_speed), 0.01, SAFE_MAX_SPEED)
-    args.jog_speed = clamp(abs(args.jog_speed), 0.001, min(args.max_speed, SAFE_MAX_JOG_SPEED))
-    args.accel = clamp(abs(args.accel), 0.01, SAFE_MAX_ACCEL)
-    args.kd = clamp(args.kd, 0.0, SAFE_MAX_KD)
-    args.return_time = max(SAFE_MIN_RETURN_TIME, args.return_time)
-    args.return_hold_time = max(0.0, args.return_hold_time)
-    args.return_kp = clamp(args.return_kp, 0.0, SAFE_MAX_RETURN_KP)
-    args.return_kd = clamp(args.return_kd, 0.0, SAFE_MAX_RETURN_KD)
+    spec = RS02_SPEC if args.model == "rs02" else RS03_SPEC
+    args.window_title = f"{spec.name} Motor Run"
+    args.geometry = "480x900"
+    args.panels = [{"title": f"{spec.name} (id {args.motor_id})", "spec": spec, "default_id": args.motor_id, "id_editable": True}]
     return args
 
 
 def main():
     args = parse_args()
     root = tk.Tk()
-    app = MotorRunApp(root, args)
-    try:
-        root.mainloop()
-    finally:
-        controller = app.controller
-        if controller is not None and controller.is_alive():
-            controller.shutdown(return_home=not args.no_return_home)
-            controller.join(timeout=SAFE_CLOSE_TIMEOUT)
-            if controller.is_alive():
-                controller.force_shutdown()
-                controller.join(timeout=0.8)
+    MotorRunApp(root, args)
+    root.mainloop()
 
 
 if __name__ == "__main__":
