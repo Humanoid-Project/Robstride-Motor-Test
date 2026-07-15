@@ -50,3 +50,39 @@ python3 set_motor_id.py --channel can0 --current-id 5 --new-id 6
 - `--current-id`: motor's current id (required)
 - `--new-id`: new id to assign (required)
 - `--yes`: skip the confirmation prompt
+
+## set_motor_id_gui.py
+
+Same as `set_motor_id.py` but as a small GUI: bus status, current ID (Scan +
+Check), new ID, and a Change button. Verifies the current ID responds before
+changing, optionally checks the new ID for a collision, then verifies the new
+ID after.
+
+Two ways to learn the current ID without typing it:
+
+- **스캔** -- sends all Type 0 (Get device ID) requests first and listens once,
+  so probing 1..127 takes ~1s instead of the ~25s a per-ID wait needs. Falls
+  back to a Type 17 pass for firmware that ignores Type 0.
+- **전원 켜서 찾기** -- listens passively for 8s while you power the motor on. A
+  Robstride motor emits two frames carrying its own ID at power-up, so this
+  works even when the motor answers no query, and it also catches motors
+  switched to the MIT protocol (standard frames, ID in byte 0).
+
+Both are read-only. The only persistent write is Type 7, behind a confirm dialog.
+
+```bash
+python3 set_motor_id_gui.py
+```
+
+- `--channel`, `--interface`, `--host-id`: same as above
+- `--scan-max`: highest id probed by Scan (default: 127)
+
+Bring the interface up first -- SocketCAN opens a DOWN interface without error
+and only fails on the first send:
+
+```bash
+sudo ip link set can0 up type can bitrate 1000000
+```
+
+Note: only one process can own the CAN interface at a time -- close the
+`motor_run` GUI before using this tool.
