@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+"""Record a motor's mechanical range while it is rotated by hand.
+
+The motor is never enabled and no control frame is sent: this script only polls
+the mechanical position parameter (0x7019), so the rotor stays free to move.
+Turn the joint to both hard stops, press Q to finish, then Y to store the result
+under the motor's ID in motor_limits.json.
+"""
+import argparse
+import json
+import math
+import os
+import select
+import struct
+import sys
+import termios
+import time
+import tty
+from datetime import datetime
+
+import can
+
+HOST_ID = 0xFD
+DEFAULT_CHANNEL = "can0"
+DEFAULT_INTERFACE = "socketcan"
+MECH_POS_INDEX = 0x7019
+
+MOTOR_IDS = list(range(1, 13))
+DEFAULT_OUTPUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "motor_limits.json")
+
+
+def build_arb(comm_type, data16, target_id):
+    return ((comm_type & 0x1F) << 24) | ((data16 & 0xFFFF) << 8) | (target_id & 0xFF)
+
+
+def parse_arb(arbitration_id):
+    comm_type = (arbitration_id >> 24) & 0x1F
+    data16 = (arbitration_id >> 8) & 0xFFFF
+    destination = arbitration_id & 0xFF
+    return comm_type, data16, destination
+
+
+def read_mech_position(bus, host_id, motor_id, timeout=0.05):
+    """Ask the motor for parameter 0x7019 and return the float, or None on timeout."""
+    data = bytearray(8)
+    struct.pack_into("<H", data, 0, MECH_POS_INDEX)
+    bus.send(can.Message(arbitration_id=build_arb(0x11, host_id, motor_id),
+                         data=bytes(data), is_extended_id=True))
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        msg = bus.recv(timeout=max(0.0, deadline - time.monotonic()))
+        if msg is None or not msg.is_extended_id:
+            continue
+        comm_type, data16, destination = parse_arb(msg.arbitration_id)
+        if comm_type != 0x11 or destination != host_id or (data16 & 0xFF) != motor_id:
+            continue
+        payload = bytes(msg.data)
+        if len(payload) < 8:
+            continue
+        if int.from_bytes(payload[0:2], "little") != MECH_POS_INDEX:
+            continue
+        return struct.unpack_from("<f", payload, 4)[0]
+    return None
+
+
+class RawKeyboard:
+    """Non-blocking single-key reads from the terminal, restoring it on exit."""
+
+    def __init__(self):
+        self.fd = sys.stdin.fileno()
+        self.saved = None
+
+    def __enter__(self):
+        self.saved = termios.tcgetattr(self.fd)
+        tty.setcbreak(self.fd)
+        return self
+
+    def __exit__(self, *_exc):
+        if self.saved is not None:
+            termios.tcsetattr(self.fd, termios.TCSADRAIN, self.saved)
+
+    def get_key(self):
+        if select.select([sys.stdin], [], [], 0)[0]:
+            return sys.stdin.read(1)
+        return None
+
+
+def fmt(rad):
+    return f"{rad:+8.4f} rad ({math.degrees(rad):+8.2f} deg)"
+
+
+def load_document(path):
+    """Return the stored document, creating the ID1..ID12 skeleton when absent."""
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as handle:
+            document = json.load(handle)
+    else:
+        document = {}
+
+    for motor_id in MOTOR_IDS:
+        document.setdefault(f"ID{motor_id}", None)
+    return document
+
+
+def save_document(path, document):
+    ordered = {f"ID{motor_id}": document.get(f"ID{motor_id}") for motor_id in MOTOR_IDS}
+    for key, value in document.items():
+        if key not in ordered:
+            ordered[key] = value
+
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as handle:
+        json.dump(ordered, handle, indent=2, ensure_ascii=False)
+        handle.write("\n")
+    os.replace(tmp_path, path)
+
+
+def print_entry(label, entry):
+    print(f"  {label}")
+    print(f"    min      : {fmt(entry['min_rad'])}")
+    print(f"    max      : {fmt(entry['max_rad'])}")
+    print(f"    range    : {fmt(entry['range_rad'])}")
+    print(f"    center   : {fmt(entry['center_rad'])}")
+    print(f"    samples  : {entry['samples']}")
+    print(f"    recorded : {entry['recorded_at']}")
+
+
+def wait_for_yes_no(prompt, keyboard):
+    """Block until Y or N is pressed. Returns True for Y."""
+    print(prompt, end="", flush=True)
+    while True:
+        key = keyboard.get_key()
+        if key is None:
+            time.sleep(0.02)
+            continue
+        if key in ("y", "Y"):
+            print("Y")
+            return True
+        if key in ("n", "N", "q", "Q", "\x03", "\x1b"):
+            print("N")
+            return False
+
+
+def measure(bus, args, keyboard):
+    """Poll position until Q is pressed. Returns the entry, or None if nothing was read."""
+    minimum = None
+    maximum = None
+    samples = 0
+    misses = 0
+    period = 1.0 / args.rate
+    next_tick = time.monotonic()
+
+    print(f"Recording motor ID {args.motor_id} on {args.channel}.")
+    print("Rotate the joint by hand through its full travel. Press Q when done.\n")
+
+    while True:
+        key = keyboard.get_key()
+        if key in ("q", "Q", "\x03"):
+            break
+
+        position = read_mech_position(bus, args.host_id, args.motor_id, timeout=args.timeout)
+        if position is None:
+            misses += 1
+            status = f"no response ({misses})"
+        else:
+            samples += 1
+            minimum = position if minimum is None else min(minimum, position)
+            maximum = position if maximum is None else max(maximum, position)
+            status = (f"now {fmt(position)}   min {math.degrees(minimum):+8.2f}"
+                      f"   max {math.degrees(maximum):+8.2f} deg")
+        print(f"\r  {status}    ", end="", flush=True)
+
+        next_tick += period
+        sleep_time = next_tick - time.monotonic()
+        if sleep_time > 0:
+            time.sleep(sleep_time)
+        else:
+            next_tick = time.monotonic()
+
+    print("\n")
+    if minimum is None:
+        return None
+
+    return {
+        "min_rad": minimum,
+        "max_rad": maximum,
+        "min_deg": math.degrees(minimum),
+        "max_deg": math.degrees(maximum),
+        "range_rad": maximum - minimum,
+        "range_deg": math.degrees(maximum - minimum),
+        "center_rad": (maximum + minimum) / 2.0,
+        "center_deg": math.degrees((maximum + minimum) / 2.0),
+        "samples": samples,
+        "recorded_at": datetime.now().isoformat(timespec="seconds"),
+    }
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Record min/max mechanical position while turning a motor by hand.")
+    parser.add_argument("--motor-id", type=lambda v: int(v, 0), required=True,
+                        help="motor CAN ID being calibrated (stored as ID<n>)")
+    parser.add_argument("--channel", default=DEFAULT_CHANNEL, help="CAN channel, default: can0")
+    parser.add_argument("--interface", default=DEFAULT_INTERFACE,
+                        help="python-can interface, default: socketcan")
+    parser.add_argument("--host-id", type=lambda v: int(v, 0), default=HOST_ID,
+                        help="host CAN ID used in the private protocol, default: 0xFD")
+    parser.add_argument("--output", default=DEFAULT_OUTPUT,
+                        help="JSON file to update, default: calibration/motor_limits.json")
+    parser.add_argument("--rate", type=float, default=50.0, help="polls per second, default: 50")
+    parser.add_argument("--timeout", type=float, default=0.05,
+                        help="seconds to wait for each reply, default: 0.05")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    key = f"ID{args.motor_id}"
+    document = load_document(args.output)
+    previous = document.get(key)
+
+    if not sys.stdin.isatty():
+        print("This tool needs an interactive terminal for the Q/Y keys.")
+        return 1
+
+    bus = can.Bus(channel=args.channel, interface=args.interface)
+    try:
+        if read_mech_position(bus, args.host_id, args.motor_id, timeout=0.3) is None:
+            print(f"Motor ID {args.motor_id} did not respond on {args.channel}. Check wiring and ID.")
+            return 1
+
+        with RawKeyboard() as keyboard:
+            entry = measure(bus, args, keyboard)
+            if entry is None:
+                print("No position samples were received; nothing to record.")
+                return 1
+
+            print(f"Measured range for {key}:")
+            print_entry("this session", entry)
+            print()
+
+            if previous is None:
+                saved = wait_for_yes_no(f"Save this as {key}? [Y/n] ", keyboard)
+            else:
+                print(f"{key} already has a stored calibration:")
+                print_entry("previously stored", previous)
+                print()
+                saved = wait_for_yes_no(
+                    f"Replace the stored {key} values with this session's? [Y/n] ", keyboard)
+
+            if not saved:
+                print(f"\nDiscarded. {args.output} was left unchanged.")
+                return 0
+
+        document[key] = entry
+        save_document(args.output, document)
+        print(f"\nSaved {key} to {args.output}.")
+        return 0
+    finally:
+        bus.shutdown()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
