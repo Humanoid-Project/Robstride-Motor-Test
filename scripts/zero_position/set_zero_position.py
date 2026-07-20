@@ -1,14 +1,4 @@
 #!/usr/bin/env python3
-"""Set a motor's current position as its mechanical zero (communication type 6).
-
-Pose the joint at its home position by hand, then run this to make that pose 0.
-The motor is never enabled and no control frame is sent, so it stays free to move.
-
-The manual does not state whether type 6 survives a power cycle, so --verify walks
-through the check: set zero, power the motor down and back up without moving the
-joint, and read the position again. Near 0 means the zero is stored in the motor;
-back at the original value means it is not, and the zero must be kept in software.
-"""
 import argparse
 import math
 import os
@@ -35,10 +25,8 @@ SAVE_PAYLOAD = bytes([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08])
 
 TWO_PI = 2.0 * math.pi
 
-
 def build_arb(comm_type, data16, target_id):
     return ((comm_type & 0x1F) << 24) | ((data16 & 0xFFFF) << 8) | (target_id & 0xFF)
-
 
 def parse_arb(arbitration_id):
     comm_type = (arbitration_id >> 24) & 0x1F
@@ -46,9 +34,7 @@ def parse_arb(arbitration_id):
     destination = arbitration_id & 0xFF
     return comm_type, data16, destination
 
-
 def read_mech_position(bus, host_id, motor_id, timeout=0.2):
-    """Ask the motor for parameter 0x7019 and return the float, or None on timeout."""
     data = bytearray(8)
     struct.pack_into("<H", data, 0, MECH_POS_INDEX)
     bus.send(can.Message(arbitration_id=build_arb(0x11, host_id, motor_id),
@@ -68,7 +54,6 @@ def read_mech_position(bus, host_id, motor_id, timeout=0.2):
         return struct.unpack_from("<f", payload, 4)[0]
     return None
 
-
 def read_mech_position_retry(bus, host_id, motor_id, attempts=5, timeout=0.2):
     for _ in range(attempts):
         position = read_mech_position(bus, host_id, motor_id, timeout=timeout)
@@ -76,23 +61,17 @@ def read_mech_position_retry(bus, host_id, motor_id, attempts=5, timeout=0.2):
             return position
     return None
 
-
 def set_mechanical_zero(bus, host_id, motor_id):
-    """Communication type 6: make the current position the mechanical zero."""
     data = bytearray(8)
     data[0] = 1
     bus.send(can.Message(arbitration_id=build_arb(TYPE_SET_ZERO, host_id, motor_id),
                          data=bytes(data), is_extended_id=True))
-    # The motor answers with a type 2 feedback frame; drain briefly so the reply
-    # does not sit in the buffer and confuse the next read.
     deadline = time.monotonic() + 0.2
     while time.monotonic() < deadline:
         if bus.recv(timeout=max(0.0, deadline - time.monotonic())) is None:
             break
 
-
 def write_uint8_parameter(bus, host_id, motor_id, index, value):
-    """Communication type 18: single parameter write (lost on power failure)."""
     data = bytearray(8)
     struct.pack_into("<H", data, 0, index)
     data[4] = value & 0xFF
@@ -100,16 +79,12 @@ def write_uint8_parameter(bus, host_id, motor_id, index, value):
                          data=bytes(data), is_extended_id=True))
     time.sleep(0.05)
 
-
 def save_parameters(bus, host_id, motor_id):
-    """Communication type 22: persist the 0x20xx parameter group to flash."""
     bus.send(can.Message(arbitration_id=build_arb(TYPE_SAVE, host_id, motor_id),
                          data=SAVE_PAYLOAD, is_extended_id=True))
     time.sleep(0.3)
 
-
 class RawKeyboard:
-    """Non-blocking single-key reads from the terminal, restoring it on exit."""
 
     def __init__(self):
         self.fd = sys.stdin.fileno()
@@ -147,26 +122,16 @@ class RawKeyboard:
                 print("N")
                 return False
 
-
 def fmt(rad):
     return f"{rad:+8.4f} rad ({math.degrees(rad):+8.2f} deg)"
 
-
 def angular_diff(a, b):
-    """Shortest signed difference a - b, wrapped into -pi..pi.
-
-    zero_sta decides whether the motor reports 0..2pi or -pi..pi after power-on,
-    so a raw subtraction would call 0.01 and 6.27 rad far apart when they are not.
-    """
     return (a - b + math.pi) % TWO_PI - math.pi
-
 
 def open_bus(args):
     return can.Bus(channel=args.channel, interface=args.interface)
 
-
 def reconnect(args, keyboard):
-    """Reopen the bus after a power cycle, waiting for the motor to answer again."""
     deadline = time.monotonic() + args.reconnect_timeout
     last_error = None
     while time.monotonic() < deadline:
@@ -177,7 +142,7 @@ def reconnect(args, keyboard):
             if position is not None:
                 return bus, position
             bus.shutdown()
-        except Exception as exc:  # the socketcan link may still be down
+        except Exception as exc:
             last_error = exc
             if bus is not None:
                 try:
@@ -191,7 +156,6 @@ def reconnect(args, keyboard):
     if last_error is not None:
         print(f"  last error: {last_error}")
     return None, None
-
 
 def verify_power_cycle(args, keyboard, before_zero):
     print("\n--- Power cycle check ---")
@@ -212,7 +176,7 @@ def verify_power_cycle(args, keyboard, before_zero):
     if bus is None:
         print("Could not reach the motor after the power cycle.")
         print("Bring the CAN link back up and re-read the position manually:")
-        print(f"  .venv/bin/python test/find_motor_id.py --check-id {args.motor_id}")
+        print(f"  .venv/bin/python scripts/motor_id/find_motor_id.py --check-id {args.motor_id}")
         return
 
     try:
@@ -234,7 +198,6 @@ def verify_power_cycle(args, keyboard, before_zero):
             print("  cycle, or something is driving it. Re-run and hold it still.")
     finally:
         bus.shutdown()
-
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -259,7 +222,6 @@ def parse_args():
                         help="seconds to wait for the motor after a power cycle, default: 30")
     parser.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
     return parser.parse_args()
-
 
 def main():
     args = parse_args()
@@ -328,7 +290,6 @@ def main():
     finally:
         if bus is not None:
             bus.shutdown()
-
 
 if __name__ == "__main__":
     sys.exit(main())

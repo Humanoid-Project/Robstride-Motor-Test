@@ -11,7 +11,6 @@ from tkinter import messagebox, ttk
 
 import can
 
-
 HOST_ID = 0xFD
 DEFAULT_MOTOR_ID = 5
 DEFAULT_CHANNEL = "can0"
@@ -37,7 +36,6 @@ MECH_POS_INDEX = 0x7019
 RUN_MODE_INDEX = 0x7005
 OPERATION_RUN_MODE = 0
 
-
 class MotorSpec:
     def __init__(self, name, p_min, p_max, v_min, v_max, t_min, t_max, kp_max, kd_max):
         self.name = name
@@ -50,32 +48,24 @@ class MotorSpec:
         self.kp_max = kp_max
         self.kd_max = kd_max
 
-
-# Manual section 4.1.2 (operation control mode, Type 1 frame) encoding ranges.
-# Position range is the same for both models; velocity/torque/Kp/Kd are not.
 RS03_SPEC = MotorSpec("RS03", -12.57, 12.57, -20.0, 20.0, -60.0, 60.0, kp_max=5000.0, kd_max=100.0)
 RS02_SPEC = MotorSpec("RS02", -12.57, 12.57, -44.0, 44.0, -17.0, 17.0, kp_max=500.0, kd_max=5.0)
 
-
 def clamp(value, min_value, max_value):
     return max(min_value, min(max_value, value))
-
 
 def float_to_uint(x, x_min, x_max, bits):
     x = max(x_min, min(x_max, x))
     return int((x - x_min) / (x_max - x_min) * ((1 << bits) - 1))
 
-
 def uint_to_float(x, x_min, x_max, bits):
     return x / ((1 << bits) - 1) * (x_max - x_min) + x_min
-
 
 def parse_arbitration_id(arbitration_id):
     comm_type = (arbitration_id >> 24) & 0x1F
     data16 = (arbitration_id >> 8) & 0xFFFF
     destination = arbitration_id & 0xFF
     return comm_type, data16, destination
-
 
 def parse_feedback(msg, host_id, motor_id, spec):
     if msg is None or not msg.is_extended_id:
@@ -106,7 +96,6 @@ def parse_feedback(msg, host_id, motor_id, spec):
         "mode_status": mode_status,
     }
 
-
 def parse_float_parameter(msg, host_id, motor_id, index):
     if msg is None or not msg.is_extended_id:
         return None
@@ -125,7 +114,6 @@ def parse_float_parameter(msg, host_id, motor_id, index):
         return None
 
     return struct.unpack_from("<f", data, 4)[0]
-
 
 class Motor:
     def __init__(self, bus, motor_id, host_id, spec):
@@ -223,7 +211,6 @@ class Motor:
                 return value, latest_feedback
 
         return None, latest_feedback
-
 
 class MotorController(threading.Thread):
     def __init__(self, args, event_queue):
@@ -749,9 +736,6 @@ class MotorController(threading.Thread):
                             -self.args.max_speed,
                             self.args.max_speed,
                         )
-                        # Kp is always 0 here: `pos` below is just the last-known
-                        # actual position, not a real setpoint, so a nonzero Kp
-                        # would fight a stale/lagged error and amplify (runaway).
                         feedback = motor.control_operation_mode(
                             pos=self.current_position(),
                             vel=self.command_velocity,
@@ -788,7 +772,6 @@ class MotorController(threading.Thread):
                 bus.shutdown()
             self.enabled = False
             self.publish_status("Closed")
-
 
 class GraphCanvas(tk.Canvas):
     def __init__(self, parent, history_seconds=10.0, **kwargs):
@@ -892,7 +875,6 @@ class GraphCanvas(tk.Canvas):
             if len(points) >= 4:
                 self.create_line(*points, fill=color, width=2, smooth=True)
 
-
 def mode_status_name(mode_status):
     names = {
         0: "Reset",
@@ -900,7 +882,6 @@ def mode_status_name(mode_status):
         2: "Run",
     }
     return names.get(mode_status, "Unknown")
-
 
 def make_controller_args(channel, interface, motor_id, spec, host_id=HOST_ID, **overrides):
     args = argparse.Namespace(
@@ -925,9 +906,7 @@ def make_controller_args(channel, interface, motor_id, spec, host_id=HOST_ID, **
         setattr(args, key, value)
     return args
 
-
 class MotorPanel:
-    """One motor's graph, live state, and controls (Velocity + Position tabs), bound to its own controller thread."""
 
     def __init__(self, parent, title, spec, channel, interface, default_id, id_editable=True,
                  host_id=HOST_ID, available_specs=None):
@@ -1218,9 +1197,7 @@ class MotorPanel:
     def shutdown(self):
         self._stop_controller(return_home=False)
 
-
 class MotorRunApp:
-    """Top-level window hosting one or more MotorPanels side by side."""
 
     def __init__(self, root, args):
         self.root = root
@@ -1279,7 +1256,6 @@ class MotorRunApp:
             panel.shutdown()
         self.root.destroy()
 
-
 def parse_args():
     parser = argparse.ArgumentParser(description="GUI speed/position control and live plotting for a single motor.")
     parser.add_argument("--channel", default=DEFAULT_CHANNEL, help="CAN channel, default: can0")
@@ -1295,13 +1271,11 @@ def parse_args():
     args.panels = [{"title": f"{spec.name} (id {args.motor_id})", "spec": spec, "default_id": args.motor_id, "id_editable": True}]
     return args
 
-
 def main():
     args = parse_args()
     root = tk.Tk()
     MotorRunApp(root, args)
     root.mainloop()
-
 
 if __name__ == "__main__":
     main()

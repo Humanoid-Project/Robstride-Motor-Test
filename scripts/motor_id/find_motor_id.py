@@ -10,17 +10,14 @@ DEFAULT_CHANNEL = "can0"
 DEFAULT_INTERFACE = "socketcan"
 MECH_POS_INDEX = 0x7019
 
-
 def build_arb(comm_type, data16, target_id):
     return ((comm_type & 0x1F) << 24) | ((data16 & 0xFFFF) << 8) | (target_id & 0xFF)
-
 
 def parse_arb(arbitration_id):
     comm_type = (arbitration_id >> 24) & 0x1F
     data16 = (arbitration_id >> 8) & 0xFFFF
     destination = arbitration_id & 0xFF
     return comm_type, data16, destination
-
 
 def get_device_id(bus, host_id, target_id, timeout=0.3):
     arb = build_arb(0x00, host_id, target_id)
@@ -37,7 +34,6 @@ def get_device_id(bus, host_id, target_id, timeout=0.3):
             return motor_id, uid
     return None
 
-
 def read_mech_position(bus, host_id, target_id, timeout=0.3):
     data = bytearray(8)
     struct.pack_into("<H", data, 0, MECH_POS_INDEX)
@@ -52,7 +48,6 @@ def read_mech_position(bus, host_id, target_id, timeout=0.3):
         if destination == host_id and (data16 & 0xFF) == target_id:
             return True
     return False
-
 
 def scan(bus, host_id, id_range):
     found = []
@@ -69,7 +64,6 @@ def scan(bus, host_id, id_range):
     if not found:
         print("  no motors responded")
     return found
-
 
 def main():
     parser = argparse.ArgumentParser(description="Find which CAN IDs Robstride motors are answering on.")
@@ -96,7 +90,6 @@ def main():
               f"{'responds' if answers else 'NO RESPONSE'}")
     finally:
         bus.shutdown()
-
 
 if __name__ == "__main__":
     main()

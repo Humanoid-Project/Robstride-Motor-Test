@@ -18,21 +18,42 @@ sudo ip link set can0 up type can bitrate 1000000
 sudo ip link set can0 txqueuelen 1000
 ```
 
-## Usage
+## Motor Test
 
 ### 1. motor_run
 
-[![motor_run](https://img.shields.io/badge/docs-motor__run-blue)](motor_run/README.md)
-
-GUI apps
-
 ```bash
-cd motor_run/
+cd scripts/motor_run/
 
-python3 motor_run.py          # single motor
-python3 daisy_chain_run.py    # two motors, daisy-chained
+python3 motor_run.py
+python3 daisy_chain_run.py
 ```
 
-### 2. test
+### 2. motor_id
 
-[![test](https://img.shields.io/badge/docs-test-green)](test/README.md)
+```bash
+cd scripts/motor_id/
+
+python3 find_motor_id.py --scan
+python3 find_motor_id.py --check-id {ID}
+python3 set_motor_id.py --current-id {ID} --new-id {NEW_ID}
+python3 set_motor_id_gui.py
+```
+
+### 3. calibration
+
+```bash
+cd scripts/calibration/
+
+python3 motor_calibration.py --motor-id {ID}
+```
+
+### 4. zero_position
+
+```bash
+cd scripts/zero_position/
+
+python3 set_zero_position.py --motor-id {ID}
+python3 set_zero_position.py --motor-id {ID} --verify
+python3 set_zero_position.py --motor-id {ID} --zero-sta 1
+```

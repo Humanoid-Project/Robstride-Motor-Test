@@ -1,11 +1,4 @@
 #!/usr/bin/env python3
-"""Record a motor's mechanical range while it is rotated by hand.
-
-The motor is never enabled and no control frame is sent: this script only polls
-the mechanical position parameter (0x7019), so the rotor stays free to move.
-Turn the joint to both hard stops, press Q to finish, then Y to store the result
-under the motor's ID in motor_limits.json.
-"""
 import argparse
 import json
 import math
@@ -28,10 +21,8 @@ MECH_POS_INDEX = 0x7019
 MOTOR_IDS = list(range(1, 13))
 DEFAULT_OUTPUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "motor_limits.json")
 
-
 def build_arb(comm_type, data16, target_id):
     return ((comm_type & 0x1F) << 24) | ((data16 & 0xFFFF) << 8) | (target_id & 0xFF)
-
 
 def parse_arb(arbitration_id):
     comm_type = (arbitration_id >> 24) & 0x1F
@@ -39,9 +30,7 @@ def parse_arb(arbitration_id):
     destination = arbitration_id & 0xFF
     return comm_type, data16, destination
 
-
 def read_mech_position(bus, host_id, motor_id, timeout=0.05):
-    """Ask the motor for parameter 0x7019 and return the float, or None on timeout."""
     data = bytearray(8)
     struct.pack_into("<H", data, 0, MECH_POS_INDEX)
     bus.send(can.Message(arbitration_id=build_arb(0x11, host_id, motor_id),
@@ -63,9 +52,7 @@ def read_mech_position(bus, host_id, motor_id, timeout=0.05):
         return struct.unpack_from("<f", payload, 4)[0]
     return None
 
-
 class RawKeyboard:
-    """Non-blocking single-key reads from the terminal, restoring it on exit."""
 
     def __init__(self):
         self.fd = sys.stdin.fileno()
@@ -85,13 +72,10 @@ class RawKeyboard:
             return sys.stdin.read(1)
         return None
 
-
 def fmt(rad):
     return f"{rad:+8.4f} rad ({math.degrees(rad):+8.2f} deg)"
 
-
 def load_document(path):
-    """Return the stored document, creating the ID1..ID12 skeleton when absent."""
     if os.path.exists(path):
         with open(path, "r", encoding="utf-8") as handle:
             document = json.load(handle)
@@ -101,7 +85,6 @@ def load_document(path):
     for motor_id in MOTOR_IDS:
         document.setdefault(f"ID{motor_id}", None)
     return document
-
 
 def save_document(path, document):
     ordered = {f"ID{motor_id}": document.get(f"ID{motor_id}") for motor_id in MOTOR_IDS}
@@ -115,7 +98,6 @@ def save_document(path, document):
         handle.write("\n")
     os.replace(tmp_path, path)
 
-
 def print_entry(label, entry):
     print(f"  {label}")
     print(f"    min      : {fmt(entry['min_rad'])}")
@@ -125,9 +107,7 @@ def print_entry(label, entry):
     print(f"    samples  : {entry['samples']}")
     print(f"    recorded : {entry['recorded_at']}")
 
-
 def wait_for_yes_no(prompt, keyboard):
-    """Block until Y or N is pressed. Returns True for Y."""
     print(prompt, end="", flush=True)
     while True:
         key = keyboard.get_key()
@@ -141,9 +121,7 @@ def wait_for_yes_no(prompt, keyboard):
             print("N")
             return False
 
-
 def measure(bus, args, keyboard):
-    """Poll position until Q is pressed. Returns the entry, or None if nothing was read."""
     minimum = None
     maximum = None
     samples = 0
@@ -195,7 +173,6 @@ def measure(bus, args, keyboard):
         "recorded_at": datetime.now().isoformat(timespec="seconds"),
     }
 
-
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Record min/max mechanical position while turning a motor by hand.")
@@ -207,12 +184,11 @@ def parse_args():
     parser.add_argument("--host-id", type=lambda v: int(v, 0), default=HOST_ID,
                         help="host CAN ID used in the private protocol, default: 0xFD")
     parser.add_argument("--output", default=DEFAULT_OUTPUT,
-                        help="JSON file to update, default: calibration/motor_limits.json")
+                        help="JSON file to update, default: scripts/calibration/motor_limits.json")
     parser.add_argument("--rate", type=float, default=50.0, help="polls per second, default: 50")
     parser.add_argument("--timeout", type=float, default=0.05,
                         help="seconds to wait for each reply, default: 0.05")
     return parser.parse_args()
-
 
 def main():
     args = parse_args()
@@ -259,7 +235,6 @@ def main():
         return 0
     finally:
         bus.shutdown()
-
 
 if __name__ == "__main__":
     sys.exit(main())

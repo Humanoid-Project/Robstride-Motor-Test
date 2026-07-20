@@ -5,10 +5,8 @@ import tkinter as tk
 import motor_run as mr
 from motor_run import MotorRunApp, RS02_SPEC, RS03_SPEC
 
-
 def _spec_for(model):
     return RS02_SPEC if model == "rs02" else RS03_SPEC
-
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -31,13 +29,11 @@ def parse_args():
     ]
     return args
 
-
 def main():
     args = parse_args()
     root = tk.Tk()
     MotorRunApp(root, args)
     root.mainloop()
-
 
 if __name__ == "__main__":
     main()

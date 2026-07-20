@@ -6,5 +6,6 @@ __pycache__/
 
 .agents/
 .codex/
+.claude/
 
 docs/
