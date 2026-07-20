@@ -21,6 +21,21 @@ MECH_POS_INDEX = 0x7019
 MOTOR_IDS = list(range(1, 13))
 DEFAULT_OUTPUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "motor_limits.json")
 
+JOINT_MAP = {
+    1:  "left_hip_yaw",
+    2:  "left_hip_pitch",
+    3:  "left_hip_roll",
+    4:  "left_knee_pitch",
+    5:  "left_ankle_pitch",
+    6:  "left_ankle_roll",
+    7:  "right_hip_yaw",
+    8:  "right_hip_pitch",
+    9:  "right_hip_roll",
+    10: "right_knee_pitch",
+    11: "right_ankle_pitch",
+    12: "right_ankle_roll",
+}
+
 def build_arb(comm_type, data16, target_id):
     return ((comm_type & 0x1F) << 24) | ((data16 & 0xFFFF) << 8) | (target_id & 0xFF)
 
@@ -75,6 +90,16 @@ class RawKeyboard:
 def fmt(rad):
     return f"{rad:+8.4f} rad ({math.degrees(rad):+8.2f} deg)"
 
+def resolve_joint_key(motor_id):
+    name = JOINT_MAP.get(motor_id)
+    if name is None:
+        print(f"Warning: CAN ID {motor_id} is not in JOINT_MAP; saving under 'ID{motor_id}'.")
+        return f"ID{motor_id}"
+    return name
+
+def joint_key_for_id(motor_id):
+    return JOINT_MAP.get(motor_id, f"ID{motor_id}")
+
 def load_document(path):
     if os.path.exists(path):
         with open(path, "r", encoding="utf-8") as handle:
@@ -83,11 +108,12 @@ def load_document(path):
         document = {}
 
     for motor_id in MOTOR_IDS:
-        document.setdefault(f"ID{motor_id}", None)
+        document.setdefault(joint_key_for_id(motor_id), None)
     return document
 
 def save_document(path, document):
-    ordered = {f"ID{motor_id}": document.get(f"ID{motor_id}") for motor_id in MOTOR_IDS}
+    ordered_keys = [joint_key_for_id(motor_id) for motor_id in MOTOR_IDS]
+    ordered = {key: document.get(key) for key in ordered_keys}
     for key, value in document.items():
         if key not in ordered:
             ordered[key] = value
@@ -100,12 +126,16 @@ def save_document(path, document):
 
 def print_entry(label, entry):
     print(f"  {label}")
+    if "can_id" in entry:
+        print(f"    can_id   : {entry['can_id']}")
     print(f"    min      : {fmt(entry['min_rad'])}")
     print(f"    max      : {fmt(entry['max_rad'])}")
     print(f"    range    : {fmt(entry['range_rad'])}")
     print(f"    center   : {fmt(entry['center_rad'])}")
     print(f"    samples  : {entry['samples']}")
     print(f"    recorded : {entry['recorded_at']}")
+    if "zeroed_at_reference" in entry:
+        print(f"    zeroed   : {'yes' if entry['zeroed_at_reference'] else 'NO'}")
 
 def wait_for_yes_no(prompt, keyboard):
     print(prompt, end="", flush=True)
@@ -177,7 +207,7 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Record min/max mechanical position while turning a motor by hand.")
     parser.add_argument("--motor-id", type=lambda v: int(v, 0), required=True,
-                        help="motor CAN ID being calibrated (stored as ID<n>)")
+                        help="motor CAN ID being calibrated (name looked up in JOINT_MAP)")
     parser.add_argument("--channel", default=DEFAULT_CHANNEL, help="CAN channel, default: can0")
     parser.add_argument("--interface", default=DEFAULT_INTERFACE,
                         help="python-can interface, default: socketcan")
@@ -192,7 +222,7 @@ def parse_args():
 
 def main():
     args = parse_args()
-    key = f"ID{args.motor_id}"
+    key = resolve_joint_key(args.motor_id)
     document = load_document(args.output)
     previous = document.get(key)
 
@@ -207,14 +237,28 @@ def main():
             return 1
 
         with RawKeyboard() as keyboard:
-            entry = measure(bus, args, keyboard)
-            if entry is None:
+            zeroed = wait_for_yes_no(
+                "이 모터는 기준 자세에서 Set Zero Position이 완료된 상태인가? [Y/n] ", keyboard)
+            print()
+
+            raw = measure(bus, args, keyboard)
+            if raw is None:
                 print("No position samples were received; nothing to record.")
                 return 1
 
-            print(f"Measured range for {key}:")
+            entry = {
+                "can_id": args.motor_id,
+                "zeroed_at_reference": zeroed,
+                **raw,
+            }
+
+            print(f"Measured range for {key} (can_id {args.motor_id}):")
             print_entry("this session", entry)
             print()
+
+            if not zeroed:
+                print("경고: 이 측정값은 기준 자세에서 영점이 잡히지 않은 상태로 기록됨 "
+                      "(기준점이 불확실함).\n")
 
             if previous is None:
                 saved = wait_for_yes_no(f"Save this as {key}? [Y/n] ", keyboard)
